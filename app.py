@@ -58,11 +58,30 @@ def fetch_global_market_data():
     return data
 
 
+@st.cache_data(ttl=600)
+def fetch_indicator_history(symbol: str, timeframe: str):
+    """依日／週／月週期抓取市場指標歷史走勢"""
+    cfg = {
+        "日線": {"period": "6mo", "interval": "1d", "ma_short": 20, "ma_long": 60, "ma_s_name": "20日均線", "ma_l_name": "60日均線"},
+        "週線": {"period": "2y", "interval": "1wk", "ma_short": 20, "ma_long": 60, "ma_s_name": "20週均線", "ma_l_name": "60週均線"},
+        "月線": {"period": "5y", "interval": "1mo", "ma_short": 12, "ma_long": 24, "ma_s_name": "12月均線(年線)", "ma_l_name": "24月均線"},
+    }[timeframe]
+    try:
+        df = yf.Ticker(symbol).history(period=cfg["period"], interval=cfg["interval"])
+        if df.empty:
+            return None, cfg
+        df = df.copy()
+        df["MA_S"] = df["Close"].rolling(cfg["ma_short"]).mean()
+        df["MA_L"] = df["Close"].rolling(cfg["ma_long"]).mean()
+        return df, cfg
+    except Exception:
+        return None, cfg
+
+
 @st.cache_data(ttl=43200)  # 美國 CPI 為月度數據，快取 12 小時
 def fetch_us_cpi_data():
     """免 API Key 抓取美國最新 CPI 與核心 CPI 年增率 (%)：優先用 BLS 官方 API v1，備援用 FRED CSV"""
     now_year = datetime.now().year
-    # 1) 優先使用美國勞工統計局 BLS Public API v1
     try:
         bls_url = "https://api.bls.gov/publicAPI/v1/timeseries/data/"
         payload = {
@@ -103,7 +122,6 @@ def fetch_us_cpi_data():
     except Exception:
         pass
 
-    # 2) 備援：FRED 公開 CSV
     def _get_fred_yoy(series_id: str):
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -245,7 +263,6 @@ def fetch_taifex_futures_data():
                     if len(date_str) == 8 and date_str.isdigit():
                         date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
-                    # 1) 外資臺股期貨（大台）
                     if ("臺股期貨" in vals or "台股期貨" in vals) and "外資" in vals and not foreign_tx["ok"]:
                         foreign_tx = {
                             "net_oi": net_oi,
@@ -255,14 +272,12 @@ def fetch_taifex_futures_data():
                             "source": "臺灣期交所 (TAIFEX)",
                         }
 
-                    # 2) 微型臺指期貨三大法人合計（自營商 + 投信 + 外資）
                     if "微型臺指" in vals or "微型台指" in vals:
                         if any(role in vals for role in ("外資", "投信", "自營商")):
                             tmf_inst_net += net_oi
                             tmf_found = True
                             tmf_date = date_str
 
-                # 若找到微台三大法人合計，再抓全市場微台總未平倉口數計算散戶多空比
                 if tmf_found:
                     total_tmf_oi = 0
                     for d_url in daily_urls:
@@ -287,7 +302,6 @@ def fetch_taifex_futures_data():
                         except Exception:
                             continue
 
-                    # 備援：期交所官方 CSV 下載（針對 TMF）
                     if total_tmf_oi == 0:
                         try:
                             csv_url = "https://www.taifex.com.tw/cht/3/dlFutDataDown"
@@ -724,6 +738,74 @@ with tab_macro:
             st.metric(label, f"{prefix}{item['price']:.2f}", f"{item['change']:.2f}%")
             status_icon = "✅" if item["ok"] else "❌"
             st.caption(f"{status_icon} 資料日期：{item['date']}")
+
+    # ===========================
+    # 新增：管理指標走勢圖（日／週／月）
+    # ===========================
+    st.markdown("### 📈 關鍵市場指標走勢圖（日／週／月）")
+    trend_options = {
+        "台灣加權指數 (^TWII)": ("^TWII", None, None),
+        "VIX 恐慌指數 (^VIX)": ("^VIX", 18.0, "低於 18 警戒線 (過度樂觀)"),
+        "WTI 紐約原油 (CL=F)": ("CL=F", 100.0, "100 美元通膨警戒線"),
+        "布蘭特原油 (BZ=F)": ("BZ=F", None, None),
+        "台積電 ADR (TSM)": ("TSM", None, None),
+        "S&P 500 指數 (^GSPC)": ("^GSPC", None, None),
+        "美元指數 (DX-Y.NYB)": ("DX-Y.NYB", None, None),
+    }
+
+    tc1, tc2 = st.columns([2, 2])
+    with tc1:
+        selected_trend = st.selectbox("選擇要檢視走勢的指標", list(trend_options.keys()))
+    with tc2:
+        selected_tf = st.radio("切換時間週期", ["日線", "週線", "月線"], horizontal=True)
+
+    sym_t, warn_val, warn_label = trend_options[selected_trend]
+    trend_df, tf_cfg = fetch_indicator_history(sym_t, selected_tf)
+
+    if trend_df is not None and not trend_df.empty:
+        fig_trend = go.Figure()
+        fig_trend.add_trace(
+            go.Scatter(
+                x=trend_df.index,
+                y=trend_df["Close"],
+                name="收盤價",
+                line=dict(color="#1f77b4", width=2.2),
+            )
+        )
+        if trend_df["MA_S"].notna().any():
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=trend_df.index,
+                    y=trend_df["MA_S"],
+                    name=tf_cfg["ma_s_name"],
+                    line=dict(color="#ff7f0e", width=1.4),
+                )
+            )
+        if trend_df["MA_L"].notna().any():
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=trend_df.index,
+                    y=trend_df["MA_L"],
+                    name=tf_cfg["ma_l_name"],
+                    line=dict(color="#2ca02c", width=1.4),
+                )
+            )
+        if warn_val is not None:
+            fig_trend.add_hline(
+                y=warn_val,
+                line_dash="dash",
+                line_color="red",
+                annotation_text=warn_label,
+            )
+        fig_trend.update_layout(
+            title=f"{selected_trend} — {selected_tf}走勢（{tf_cfg['period']}）",
+            height=360,
+            margin=dict(l=20, r=20, t=45, b=20),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
+    else:
+        st.info("暫時無法取得該指標的歷史走勢資料，請稍後再試。")
 
     st.markdown("### 🔍 核心指標對照與資料來源驗證")
     col_a, col_b = st.columns(2)
