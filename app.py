@@ -1,3 +1,4 @@
+import io
 import json
 import re
 from datetime import datetime, timedelta
@@ -57,6 +58,41 @@ def fetch_global_market_data():
     return data
 
 
+@st.cache_data(ttl=43200)  # 美國 CPI 為月度數據，快取 12 小時
+def fetch_fred_us_cpi():
+    """免 API Key 從聖路易斯聯準銀行 (FRED) 抓取美國最新 CPI 與核心 CPI 年增率 (%)"""
+    def _get_yoy(series_id: str):
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        date_col, val_col = df.columns[0], df.columns[1]
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna(subset=[val_col]).reset_index(drop=True)
+        if len(df) >= 13:
+            latest = float(df[val_col].iloc[-1])
+            prev_yr = float(df[val_col].iloc[-13])
+            yoy = round(((latest / prev_yr) - 1) * 100, 2)
+            obs_month = str(df[date_col].iloc[-1])[:7]  # YYYY-MM
+            return yoy, obs_month
+        return None, None
+
+    try:
+        cpi_yoy, cpi_date = _get_yoy("CPIAUCSL")
+        core_yoy, core_date = _get_yoy("CPILFESL")
+        if cpi_yoy is not None and core_yoy is not None:
+            return {
+                "cpi": cpi_yoy,
+                "core_cpi": core_yoy,
+                "date": cpi_date or core_date,
+                "ok": True,
+                "source": "美國聯準會 FRED",
+            }
+    except Exception:
+        pass
+    return {"cpi": None, "core_cpi": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
+
+
 @st.cache_data(ttl=1800)
 def fetch_twse_margin_debt():
     """從臺灣證券交易所抓取最近一個交易日的上市融資餘額（億元）"""
@@ -97,72 +133,112 @@ def fetch_twse_margin_debt():
     return {"value": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
 
 
+def _extract_net_oi_from_record(item: dict):
+    """從期交所三大法人單筆紀錄中解析未平倉淨口數"""
+    for k, v in item.items():
+        kl = k.lower()
+        if ("net" in kl and "openinterest" in kl and ("contract" in kl or "lot" in kl or "volume" in kl)) or (
+            "多空淨額" in k and "未平倉" in k and "口數" in k
+        ):
+            try:
+                return int(str(v).replace(",", "").strip())
+            except ValueError:
+                pass
+    long_oi, short_oi = None, None
+    for k, v in item.items():
+        kl = k.lower()
+        if ("long" in kl and "openinterest" in kl and "contract" in kl) or ("多方" in k and "未平倉" in k and "口數" in k):
+            try:
+                long_oi = int(str(v).replace(",", "").strip())
+            except ValueError:
+                pass
+        if ("short" in kl and "openinterest" in kl and "contract" in kl) or ("空方" in k and "未平倉" in k and "口數" in k):
+            try:
+                short_oi = int(str(v).replace(",", "").strip())
+            except ValueError:
+                pass
+    if long_oi is not None and short_oi is not None:
+        return long_oi - short_oi
+    return None
+
+
 @st.cache_data(ttl=1800)
-def fetch_taifex_foreign_tx():
-    """從臺灣期貨交易所 OpenAPI 抓取最新外資臺股期貨（大台）未平倉淨口數"""
-    url = "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate"
+def fetch_taifex_futures_data():
+    """從臺灣期貨交易所 OpenAPI 抓取：1) 外資大台淨空單 2) 微台三大法人淨部位與散戶多空比"""
     headers = {"User-Agent": "Mozilla/5.0"}
+    inst_url = "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate"
+    daily_url = "https://openapi.taifex.com.tw/v1/DailyMarketReport"
+
+    foreign_tx = {"net_oi": None, "short_abs": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
+    retail_tmf = {"ratio": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
+
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
+        resp = requests.get(inst_url, headers=headers, timeout=8)
         if resp.status_code == 200:
             records = resp.json()
             if isinstance(records, list):
+                tmf_inst_net = 0
+                tmf_found = False
+                tmf_date = "最近交易日"
+
                 for item in records:
                     vals = " ".join(str(v) for v in item.values())
-                    if ("臺股期貨" in vals or "台股期貨" in vals) and "外資" in vals:
-                        net_oi = None
-                        for k, v in item.items():
-                            kl = k.lower()
-                            if ("net" in kl and "openinterest" in kl and ("contract" in kl or "lot" in kl or "volume" in kl)) or (
-                                "多空淨額" in k and "未平倉" in k and "口數" in k
-                            ):
-                                try:
-                                    net_oi = int(str(v).replace(",", "").strip())
-                                    break
-                                except ValueError:
-                                    pass
+                    net_oi = _extract_net_oi_from_record(item)
+                    if net_oi is None:
+                        continue
 
-                        if net_oi is None:
-                            long_oi, short_oi = None, None
-                            for k, v in item.items():
-                                kl = k.lower()
-                                if ("long" in kl and "openinterest" in kl and "contract" in kl) or (
-                                    "多方" in k and "未平倉" in k and "口數" in k
-                                ):
+                    date_str = str(item.get("Date") or item.get("日期") or item.get("TradeDate") or "最近交易日").strip()
+                    if len(date_str) == 8 and date_str.isdigit():
+                        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+
+                    # 1) 外資臺股期貨（大台）
+                    if ("臺股期貨" in vals or "台股期貨" in vals) and "外資" in vals and not foreign_tx["ok"]:
+                        foreign_tx = {
+                            "net_oi": net_oi,
+                            "short_abs": max(-net_oi, 0),
+                            "date": date_str,
+                            "ok": True,
+                            "source": "臺灣期交所 (TAIFEX)",
+                        }
+
+                    # 2) 微型臺指期貨三大法人合計（自營商 + 投信 + 外資）
+                    if "微型臺指" in vals or "微型台指" in vals:
+                        if any(role in vals for role in ("外資", "投信", "自營商")):
+                            tmf_inst_net += net_oi
+                            tmf_found = True
+                            tmf_date = date_str
+
+                # 若找到微台三大法人合計，再抓全市場微台總未平倉口數計算散戶多空比
+                if tmf_found:
+                    try:
+                        d_resp = requests.get(daily_url, headers=headers, timeout=8)
+                        if d_resp.status_code == 200:
+                            d_records = d_resp.json()
+                            total_tmf_oi = 0
+                            for d_item in d_records:
+                                contract = str(d_item.get("Contract") or d_item.get("契約") or "").strip().upper()
+                                session = str(d_item.get("TradingSession") or d_item.get("交易時段") or "")
+                                if contract == "TMF" and ("一般" in session or "Regular" in session or session == ""):
+                                    oi_val = d_item.get("OpenInterest") or d_item.get("未沖銷契約數") or 0
                                     try:
-                                        long_oi = int(str(v).replace(",", "").strip())
+                                        total_tmf_oi += int(str(oi_val).replace(",", "").strip())
                                     except ValueError:
                                         pass
-                                if ("short" in kl and "openinterest" in kl and "contract" in kl) or (
-                                    "空方" in k and "未平倉" in k and "口數" in k
-                                ):
-                                    try:
-                                        short_oi = int(str(v).replace(",", "").strip())
-                                    except ValueError:
-                                        pass
-                            if long_oi is not None and short_oi is not None:
-                                net_oi = long_oi - short_oi
-
-                        if net_oi is not None:
-                            date_str = (
-                                item.get("Date")
-                                or item.get("日期")
-                                or item.get("TradeDate")
-                                or "最近交易日"
-                            )
-                            ds = str(date_str).strip()
-                            if len(ds) == 8 and ds.isdigit():
-                                ds = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
-                            return {
-                                "net_oi": net_oi,
-                                "short_abs": max(-net_oi, 0),
-                                "date": ds,
-                                "ok": True,
-                                "source": "臺灣期交所 (TAIFEX)",
-                            }
+                            if total_tmf_oi > 0:
+                                retail_net = -tmf_inst_net
+                                ratio_pct = round((retail_net / total_tmf_oi) * 100, 1)
+                                retail_tmf = {
+                                    "ratio": ratio_pct,
+                                    "date": tmf_date,
+                                    "ok": True,
+                                    "source": "臺灣期交所換算 (TMF)",
+                                }
+                    except Exception:
+                        pass
     except Exception:
         pass
-    return {"net_oi": None, "short_abs": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
+
+    return foreign_tx, retail_tmf
 
 
 @st.cache_data(ttl=300)
@@ -170,7 +246,6 @@ def analyze_single_stock(raw_symbol: str):
     """抓取個股近半年日線資料並計算均線、RSI、乖離率與支撐壓力"""
     sym = raw_symbol.strip().upper()
     candidates = [sym]
-    # 若為純數字或台股常見格式（如 2330、0050、00919、006208），自動嘗試 .TW 與 .TWO
     if "." not in sym and any(ch.isdigit() for ch in sym):
         candidates = [f"{sym}.TW", f"{sym}.TWO", sym]
 
@@ -194,7 +269,6 @@ def analyze_single_stock(raw_symbol: str):
     hist["MA20"] = close.rolling(20).mean()
     hist["MA60"] = close.rolling(60).mean()
 
-    # 計算 14 日 RSI
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -243,11 +317,9 @@ def evaluate_stock_action(info: dict, market_risk_score: int, cost_price: float 
 
     is_above_ma20 = price >= ma20
     is_above_ma60 = (price >= ma60) if ma60 is not None else True
-
     pnl_pct = ((price - cost_price) / cost_price * 100) if cost_price > 0 else None
 
     if cost_price > 0:
-        # 已有持股情境
         if (not is_above_ma20 and not is_above_ma60) or (pnl_pct is not None and pnl_pct <= -10):
             signal = "🔴 減碼／停損觀察"
             summary = "股價同時跌破月線與季線（或虧損達 -10% 防線），技術面轉弱。"
@@ -265,7 +337,6 @@ def evaluate_stock_action(info: dict, market_risk_score: int, cost_price: float 
             summary = "股價在月線附近震盪，方向尚待確認。"
             action = "暫不加碼，觀察能否帶量站穩月線之上。"
     else:
-        # 空手想買進情境
         if market_risk_score > 65 and (rsi >= 65 or bias20 >= 6):
             signal = "🔴 暫緩買進（避免追高）"
             summary = f"大盤系統性風險高（{market_risk_score} 分），且該股已有追價風險（乖離 {bias20:+.1f}%）。"
@@ -326,27 +397,37 @@ with ctrl_col1:
 
 market_data = fetch_global_market_data()
 twse_margin = fetch_twse_margin_debt()
-taifex_tx = fetch_taifex_foreign_tx()
+taifex_tx, taifex_retail = fetch_taifex_futures_data()
+fred_cpi = fetch_fred_us_cpi()
 
 with ctrl_col2:
     st.caption(
-        f"🕒 畫面刷新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ｜ "
-        f"台股融資：{'✅ ' + twse_margin['date'] if twse_margin['ok'] else '⚠️ 未連線(手動)'} ｜ "
-        f"外資台指期：{'✅ ' + str(taifex_tx['date']) if taifex_tx['ok'] else '⚠️ 未連線(手動)'}"
+        f"🕒 刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ｜ "
+        f"融資：{'✅ ' + twse_margin['date'] if twse_margin['ok'] else '⚠️ 手動'} ｜ "
+        f"外資期貨：{'✅ ' + str(taifex_tx['date']) if taifex_tx['ok'] else '⚠️ 手動'} ｜ "
+        f"微台散戶：{'✅ ' + str(taifex_retail['date']) if taifex_retail['ok'] else '⚠️ 手動'} ｜ "
+        f"美國CPI：{'✅ ' + str(fred_cpi['date']) if fred_cpi['ok'] else '⚠️ 手動'}"
     )
 
 # ===========================
 # 側邊欄：自動帶入 + 手動微調
 # ===========================
 st.sidebar.header("⚙️ 指標參數設定與來源狀態")
-st.sidebar.caption("已自動串接證交所與期交所；無公開 API 之項目請手動調整：")
+st.sidebar.caption("所有能公開抓取之指標皆已自動帶入，必要時亦可取消勾選改為手動：")
 
-use_auto_tx = st.sidebar.checkbox("自動帶入期交所外資台指期淨空單", value=taifex_tx["ok"], disabled=not taifex_tx["ok"])
+use_auto_tx = st.sidebar.checkbox("自動帶入外資台指期淨空單", value=taifex_tx["ok"], disabled=not taifex_tx["ok"])
 if use_auto_tx and taifex_tx["ok"]:
     custom_tx_short = taifex_tx["short_abs"]
-    st.sidebar.info(f"📡 期交所 ({taifex_tx['date']})：淨口數 {taifex_tx['net_oi']:,} 口（空單 {custom_tx_short:,} 口）")
+    st.sidebar.info(f"📡 期交所 ({taifex_tx['date']})：淨口數 {taifex_tx['net_oi']:,}（空單 {custom_tx_short:,} 口）")
 else:
     custom_tx_short = st.sidebar.number_input("外資台指期未平倉淨空單（口）", value=53072, step=1000)
+
+use_auto_retail = st.sidebar.checkbox("自動換算微台散戶多空比", value=taifex_retail["ok"], disabled=not taifex_retail["ok"])
+if use_auto_retail and taifex_retail["ok"]:
+    custom_retail_ratio = taifex_retail["ratio"]
+    st.sidebar.info(f"📡 期交所 TMF ({taifex_retail['date']})：{custom_retail_ratio:+.1f}% (偏多)")
+else:
+    custom_retail_ratio = st.sidebar.slider("微台散戶多空比（偏多 %）", min_value=-50.0, max_value=50.0, value=22.0, step=0.5)
 
 use_auto_margin = st.sidebar.checkbox("自動帶入證交所上市融資餘額", value=twse_margin["ok"], disabled=not twse_margin["ok"])
 if use_auto_margin and twse_margin["ok"]:
@@ -355,12 +436,18 @@ if use_auto_margin and twse_margin["ok"]:
 else:
     custom_margin_debt = st.sidebar.number_input("台股上市融資餘額（億元）", value=4911.0, step=50.0)
 
+use_auto_cpi = st.sidebar.checkbox("自動帶入美國 CPI / 核心 CPI", value=fred_cpi["ok"], disabled=not fred_cpi["ok"])
+if use_auto_cpi and fred_cpi["ok"]:
+    custom_cpi = fred_cpi["cpi"]
+    custom_core_cpi = fred_cpi["core_cpi"]
+    st.sidebar.info(f"📡 聯準會 FRED ({fred_cpi['date']})：CPI {custom_cpi}% / 核心 {custom_core_cpi}%")
+else:
+    custom_cpi = st.sidebar.number_input("美國最新公佈 CPI（%）", value=3.8, step=0.1)
+    custom_core_cpi = st.sidebar.number_input("美國最新核心 CPI（%）", value=2.8, step=0.1)
+
 st.sidebar.divider()
-st.sidebar.caption("以下 4 項無免費即時公開 API，請依最新公告手動調整：")
-custom_retail_ratio = st.sidebar.slider("微台散戶多空比（偏多 %）", min_value=-50, max_value=50, value=22, step=1)
-custom_etf_premium = st.sidebar.slider("熱門 ETF 溢價率（%）", min_value=-2.0, max_value=10.0, value=5.57, step=0.1)
-custom_cpi = st.sidebar.number_input("美國最新公佈 CPI（%）", value=3.8, step=0.1)
-custom_core_cpi = st.sidebar.number_input("美國最新核心 CPI（%）", value=2.8, step=0.1)
+st.sidebar.caption("熱門 ETF 溢價率依各投信盤中淨值變動，建議依觀察標的微調：")
+custom_etf_premium = st.sidebar.slider("熱門 ETF 溢價率（%）", min_value=-2.0, max_value=10.0, value=1.5, step=0.1)
 
 # ===========================
 # 2. 風險綜合評分與判斷建議引擎
@@ -389,7 +476,7 @@ if custom_retail_ratio > 20:
     risk_points += 2
     advices.append((
         "🚨",
-        f"微台散戶偏多 {custom_retail_ratio}%（> 20% 強烈反指標）",
+        f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 20% 強烈反指標）",
         "散戶高度一致做多，籌碼凌亂，行情急跌時容易出現「多殺多」洗盤。",
         "切勿跟風開槓桿做多，耐心等待急跌洗盤後再找承接點。"
     ))
@@ -397,7 +484,7 @@ elif custom_retail_ratio > 10:
     risk_points += 1
     advices.append((
         "⚠️",
-        f"微台散戶偏多 {custom_retail_ratio}%（> 10% 偏熱）",
+        f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 10% 偏熱）",
         "散戶作多意願升溫，短線波動可能放大。",
         "縮小單筆投入金額，分批進場為主。"
     ))
@@ -558,19 +645,19 @@ with tab_macro:
                 "指標名稱": ["外資期貨淨空單", "微台散戶多空比", "上市融資餘額", "熱門 ETF 溢價率"],
                 "當前數值": [
                     f"{custom_tx_short:,} 口",
-                    f"{custom_retail_ratio}% (偏多)",
+                    f"{custom_retail_ratio:+.1f}% (偏多)",
                     f"{custom_margin_debt:,.1f} 億元",
                     f"{custom_etf_premium}%",
                 ],
                 "資料來源 / 日期": [
                     f"{taifex_tx['source']} ({taifex_tx['date']})" if (use_auto_tx and taifex_tx["ok"]) else "手動輸入",
-                    "手動輸入",
+                    f"{taifex_retail['source']} ({taifex_retail['date']})" if (use_auto_retail and taifex_retail["ok"]) else "手動輸入",
                     f"{twse_margin['source']} ({twse_margin['date']})" if (use_auto_margin and twse_margin["ok"]) else "手動輸入",
                     "手動輸入",
                 ],
                 "當前警示燈號": [
                     "🔴 極度危險" if custom_tx_short > 50000 else "🟡 警戒" if custom_tx_short > 35000 else "🟢 正常",
-                    "🔴 極度反指標" if custom_retail_ratio > 20 else "🟢 正常",
+                    "🔴 極度反指標" if custom_retail_ratio > 20 else "🟡 偏熱" if custom_retail_ratio > 10 else "🟢 正常",
                     "🔴 嚴重過熱" if custom_margin_debt > 4800 else "🟢 正常",
                     "🔴 嚴重溢價" if custom_etf_premium > 3.0 else "🟢 合理",
                 ],
@@ -590,13 +677,13 @@ with tab_macro:
                     f"{market_data['VIX 恐慌指數']['price']:.2f}",
                 ],
                 "資料來源 / 日期": [
-                    "手動輸入",
-                    "手動輸入",
+                    f"{fred_cpi['source']} ({fred_cpi['date']})" if (use_auto_cpi and fred_cpi["ok"]) else "手動輸入",
+                    f"{fred_cpi['source']} ({fred_cpi['date']})" if (use_auto_cpi and fred_cpi["ok"]) else "手動輸入",
                     f"Yahoo Finance ({market_data['WTI 紐約原油']['date']})",
                     f"Yahoo Finance ({market_data['VIX 恐慌指數']['date']})",
                 ],
                 "當前警示燈號": [
-                    "🔴 重啟升息風險" if custom_cpi >= 3.8 else "🟡 偏高",
+                    "🔴 重啟升息風險" if custom_cpi >= 3.8 else "🟡 偏高" if custom_cpi >= 3.0 else "🟢 溫和",
                     "🔴 核心黏滯" if custom_core_cpi >= 2.8 else "🟢 溫和",
                     "🔴 油價破百" if market_data["WTI 紐約原油"]["price"] >= 100 else "🟢 正常",
                     "🟡 忽視風險" if 0 < market_data["VIX 恐慌指數"]["price"] < 18 else "🟢 警覺",
@@ -641,7 +728,6 @@ with tab_stock:
             pnl_msg = f" ｜ 帳面報酬率：**{pnl_pct:+.2f}%**" if pnl_pct is not None else ""
             st.info(f"### {signal}{pnl_msg}\n\n* **技術與大盤判讀**：{summary}\n* **建議做法**：{action}")
 
-            # 繪製近半年收盤價與均線圖
             hist_df = stock_info["hist"]
             fig_stock = go.Figure()
             fig_stock.add_trace(go.Scatter(x=hist_df.index, y=hist_df["Close"], name="收盤價", line=dict(color="#1f77b4", width=2)))
@@ -658,7 +744,6 @@ with tab_portfolio:
     st.subheader("📸 庫存持股截圖自動辨識與健檢")
     st.caption("上傳券商 App 的庫存截圖，系統會擷取持股並自動抓取最新技術面，結合大盤燈號給出每檔持股的操作建議。")
 
-    # 讀取 Streamlit Secrets 或臨時輸入的 Gemini API Key
     secret_key = ""
     try:
         secret_key = st.secrets.get("GEMINI_API_KEY", "")
