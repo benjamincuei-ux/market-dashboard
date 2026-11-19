@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 from datetime import datetime, timedelta
 
@@ -19,13 +20,29 @@ st.set_page_config(
 
 st.title("📊 台股過熱與總經通膨危機即時監控儀表板")
 st.markdown(
-    "監控**盤面技術、籌碼背離、槓桿資金、市場情緒與總經通膨**，並支援**個股買賣點診斷**與**庫存持股截圖健檢**。"
+    "整合**固定門檻 ＋ 歷史百分位雙軌風險評分**、**GitHub 每日籌碼存檔走勢**、**歷史策略回測**、**個股診斷**與**庫存截圖健檢**。"
 )
 
 
 # ===========================
-# 1. 自動抓取外部數據函數
+# 1. 資料讀取與自動抓取函數
 # ===========================
+@st.cache_data(ttl=300)
+def load_chips_history():
+    """讀取 GitHub Actions 每日定時存檔的 chips_history.csv"""
+    csv_path = "chips_history.csv"
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date").reset_index(drop=True)
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=300)
 def fetch_global_market_data():
     tickers = {
@@ -58,6 +75,34 @@ def fetch_global_market_data():
     return data
 
 
+@st.cache_data(ttl=1800)
+def compute_dynamic_percentiles():
+    """計算主要市場指標近 1 年的歷史百分位（0~100），作為動態過熱參考"""
+    results = {}
+    try:
+        vix_1y = yf.Ticker("^VIX").history(period="1y")["Close"].dropna()
+        if len(vix_1y) >= 20:
+            # VIX 越低代表市場越鬆懈，故反向百分位越高代表越警戒
+            pct_low = float((vix_1y >= vix_1y.iloc[-1]).mean() * 100)
+            results["VIX 鬆懈度百分位"] = round(pct_low, 1)
+
+        wti_1y = yf.Ticker("CL=F").history(period="1y")["Close"].dropna()
+        if len(wti_1y) >= 20:
+            pct_high = float((wti_1y <= wti_1y.iloc[-1]).mean() * 100)
+            results["WTI 原油高檔百分位"] = round(pct_high, 1)
+
+        twii_1y = yf.Ticker("^TWII").history(period="1y")["Close"].dropna()
+        if len(twii_1y) >= 125:
+            ma125 = twii_1y.rolling(125).mean()
+            bias_series = ((twii_1y - ma125) / ma125 * 100).dropna()
+            if len(bias_series) >= 20:
+                pct_mom = float((bias_series <= bias_series.iloc[-1]).mean() * 100)
+                results["台股半年線乖離百分位"] = round(pct_mom, 1)
+    except Exception:
+        pass
+    return results
+
+
 @st.cache_data(ttl=600)
 def fetch_indicator_history(symbol: str, timeframe: str):
     """依日／週／月週期抓取市場指標歷史走勢"""
@@ -78,7 +123,7 @@ def fetch_indicator_history(symbol: str, timeframe: str):
         return None, cfg
 
 
-@st.cache_data(ttl=43200)  # 美國 CPI 為月度數據，快取 12 小時
+@st.cache_data(ttl=43200)
 def fetch_us_cpi_data():
     """免 API Key 抓取美國最新 CPI 與核心 CPI 年增率 (%)：優先用 BLS 官方 API v1，備援用 FRED CSV"""
     now_year = datetime.now().year
@@ -205,7 +250,9 @@ def _extract_net_oi_from_record(item: dict):
         if _is_value_col(k):
             continue
         kl = k.lower()
-        if ("net" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or ("多空淨額" in k and "口數" in k):
+        if ("net" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or (
+            "多空淨額" in k and "口數" in k
+        ):
             try:
                 return int(str(v).replace(",", "").strip())
             except ValueError:
@@ -216,12 +263,16 @@ def _extract_net_oi_from_record(item: dict):
         if _is_value_col(k):
             continue
         kl = k.lower()
-        if ("long" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or ("多方" in k and "未平倉" in k and "口數" in k):
+        if ("long" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or (
+            "多方" in k and "未平倉" in k and "口數" in k
+        ):
             try:
                 long_oi = int(str(v).replace(",", "").strip())
             except ValueError:
                 pass
-        if ("short" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or ("空方" in k and "未平倉" in k and "口數" in k):
+        if ("short" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or (
+            "空方" in k and "未平倉" in k and "口數" in k
+        ):
             try:
                 short_oi = int(str(v).replace(",", "").strip())
             except ValueError:
@@ -233,7 +284,7 @@ def _extract_net_oi_from_record(item: dict):
 
 @st.cache_data(ttl=1800)
 def fetch_taifex_futures_data():
-    """從臺灣期貨交易所 OpenAPI 抓取：1) 外資大台淨空單 2) 微台三大法人淨部位與散戶多空比"""
+    """從臺灣期貨交易所 OpenAPI 抓取外資大台淨空單與微台散戶多空比"""
     headers = {"User-Agent": "Mozilla/5.0"}
     inst_url = "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate"
     daily_urls = [
@@ -404,7 +455,6 @@ def analyze_single_stock(raw_symbol: str):
 
 
 def evaluate_stock_action(info: dict, market_risk_score: int, cost_price: float = 0.0):
-    """結合個股技術面與大盤風險分數，給出明確買進／賣出／續抱參考"""
     price = info["price"]
     ma20 = info["ma20"]
     ma60 = info["ma60"]
@@ -457,8 +507,75 @@ def evaluate_stock_action(info: dict, market_risk_score: int, cost_price: float 
     return signal, summary, action, pnl_pct
 
 
+@st.cache_data(ttl=1800)
+def run_strategy_backtest(ticker: str, years: int, red_exposure: float, yellow_exposure: float):
+    """使用過去數年歷史資料，模擬「大盤動態風險減碼策略」vs「買進持有」績效（T+1 日開盤/收盤執行，含手續費與交易稅）"""
+    period_str = f"{years}y"
+    df_asset = yf.Ticker(ticker).history(period=period_str)[["Close"]].rename(columns={"Close": "asset"})
+    df_vix = yf.Ticker("^VIX").history(period=period_str)[["Close"]].rename(columns={"Close": "vix"})
+    df_wti = yf.Ticker("CL=F").history(period=period_str)[["Close"]].rename(columns={"Close": "wti"})
+
+    if df_asset.empty or df_vix.empty:
+        return None
+
+    # 對齊日期索引（移除時區差異）
+    for d in (df_asset, df_vix, df_wti):
+        d.index = pd.to_datetime(d.index).tz_localize(None).normalize()
+
+    df = df_asset.join(df_vix, how="inner").join(df_wti, how="left").ffill().dropna()
+    if len(df) < 130:
+        return None
+
+    # 以可回溯的市場指標計算歷史風險分數（0~100）
+    df["ma125"] = df["asset"].rolling(125).mean()
+    df["bias125"] = (df["asset"] - df["ma125"]) / df["ma125"] * 100
+    df["vix_pct"] = df["vix"].rolling(252, min_periods=60).apply(lambda s: (s >= s.iloc[-1]).mean() * 100, raw=False)
+    df["wti_pct"] = df["wti"].rolling(252, min_periods=60).apply(lambda s: (s <= s.iloc[-1]).mean() * 100, raw=False)
+    df["bias_pct"] = df["bias125"].rolling(252, min_periods=60).apply(lambda s: (s <= s.iloc[-1]).mean() * 100, raw=False)
+
+    df["risk_score"] = df[["vix_pct", "wti_pct", "bias_pct"]].mean(axis=1)
+    df = df.dropna(subset=["risk_score"]).copy()
+    if len(df) < 60:
+        return None
+
+    # 避免前視偏差：用前一日收盤計算出的風險分數，決定今日持股比例（T+1 執行）
+    def _target_weight(score):
+        if score > 65:
+            return red_exposure
+        elif score > 40:
+            return yellow_exposure
+        return 1.0
+
+    df["target_weight"] = df["risk_score"].shift(1).fillna(1.0).apply(_target_weight)
+    df["asset_ret"] = df["asset"].pct_change().fillna(0.0)
+
+    # 計算換倉交易成本（台股買進 0.1425%、賣出 0.1425%+0.3% 證交稅）
+    df["weight_diff"] = df["target_weight"].diff().fillna(0.0)
+    df["tx_cost"] = df["weight_diff"].apply(lambda d: abs(d) * (0.004425 if d < 0 else 0.001425))
+
+    df["strat_ret"] = df["target_weight"] * df["asset_ret"] - df["tx_cost"]
+    df["bh_nav"] = (1 + df["asset_ret"]).cumprod()
+    df["strat_nav"] = (1 + df["strat_ret"]).cumprod()
+
+    def _metrics(nav_series, ret_series):
+        n_years = max((nav_series.index[-1] - nav_series.index[0]).days / 365.25, 0.1)
+        total_ret = (nav_series.iloc[-1] - 1) * 100
+        cagr = ((nav_series.iloc[-1] ** (1 / n_years)) - 1) * 100
+        roll_max = nav_series.cummax()
+        mdd = ((nav_series / roll_max) - 1).min() * 100
+        vol = ret_series.std() * (252 ** 0.5)
+        sharpe = (ret_series.mean() * 252) / vol if vol > 0 else 0.0
+        return {"total_ret": total_ret, "cagr": cagr, "mdd": mdd, "sharpe": sharpe}
+
+    return {
+        "df": df,
+        "bh": _metrics(df["bh_nav"], df["asset_ret"]),
+        "strat": _metrics(df["strat_nav"], df["strat_ret"]),
+        "rebalances": int((df["weight_diff"] != 0).sum()),
+    }
+
+
 def parse_holdings_from_image(image: Image.Image, api_key: str):
-    """使用 Gemini Vision 辨識券商庫存截圖中的股票清單"""
     from google import genai
 
     client = genai.Client(api_key=api_key)
@@ -483,7 +600,7 @@ def parse_holdings_from_image(image: Image.Image, api_key: str):
 
 
 # ===========================
-# 頂部控制列：手動重整 & 抓取時間
+# 頂部控制列與資料載入
 # ===========================
 ctrl_col1, ctrl_col2 = st.columns([1, 4])
 with ctrl_col1:
@@ -491,51 +608,80 @@ with ctrl_col1:
         st.cache_data.clear()
         st.rerun()
 
+chips_df = load_chips_history()
 market_data = fetch_global_market_data()
-twse_margin = fetch_twse_margin_debt()
-taifex_tx, taifex_retail = fetch_taifex_futures_data()
+dyn_pcts = compute_dynamic_percentiles()
 us_cpi = fetch_us_cpi_data()
 
+# 若有 chips_history.csv，優先取其最新一筆有效值，並補上即時 API 備援
+twse_margin = fetch_twse_margin_debt()
+taifex_tx, taifex_retail = fetch_taifex_futures_data()
+
+if not chips_df.empty:
+    valid_m = chips_df.dropna(subset=["margin_debt"])
+    if not valid_m.empty and not twse_margin["ok"]:
+        twse_margin = {
+            "value": float(valid_m["margin_debt"].iloc[-1]),
+            "date": valid_m["date"].iloc[-1].strftime("%Y-%m-%d"),
+            "ok": True,
+            "source": "GitHub 每日存檔",
+        }
+    valid_tx = chips_df.dropna(subset=["tx_foreign_short"])
+    if not valid_tx.empty and not taifex_tx["ok"]:
+        taifex_tx = {
+            "net_oi": int(valid_tx["tx_foreign_net"].iloc[-1]),
+            "short_abs": int(valid_tx["tx_foreign_short"].iloc[-1]),
+            "date": valid_tx["date"].iloc[-1].strftime("%Y-%m-%d"),
+            "ok": True,
+            "source": "GitHub 每日存檔",
+        }
+    valid_rt = chips_df.dropna(subset=["retail_tmf_ratio"])
+    if not valid_rt.empty and not taifex_retail["ok"]:
+        taifex_retail = {
+            "ratio": float(valid_rt["retail_tmf_ratio"].iloc[-1]),
+            "date": valid_rt["date"].iloc[-1].strftime("%Y-%m-%d"),
+            "ok": True,
+            "source": "GitHub 每日存檔",
+        }
+
 with ctrl_col2:
+    hist_msg = f"存檔 {len(chips_df)} 天" if not chips_df.empty else "尚未建檔"
     st.caption(
         f"🕒 刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ｜ "
+        f"籌碼歷史庫：{hist_msg} ｜ "
         f"融資：{'✅ ' + twse_margin['date'] if twse_margin['ok'] else '⚠️ 手動'} ｜ "
         f"外資期貨：{'✅ ' + str(taifex_tx['date']) if taifex_tx['ok'] else '⚠️ 手動'} ｜ "
-        f"微台散戶：{'✅ ' + str(taifex_retail['date']) if taifex_retail['ok'] else '⚠️ 手動'} ｜ "
         f"美國CPI：{'✅ ' + str(us_cpi['date']) if us_cpi['ok'] else '⚠️ 手動'}"
     )
 
 # ===========================
-# 側邊欄：自動帶入 + 手動微調
+# 側邊欄：評分模式切換 + 指標參數
 # ===========================
-st.sidebar.header("⚙️ 指標參數設定與來源狀態")
-st.sidebar.caption("所有能公開抓取之指標皆已自動帶入，必要時亦可取消勾選改為手動：")
+st.sidebar.header("⚙️ 評分模式與指標參數")
+score_mode = st.sidebar.radio(
+    "風險評分演算法",
+    ["混合模式（推薦：固定門檻＋歷史百分位）", "傳統固定門檻（0~12點制）", "純動態歷史百分位（對標 CNN 模型）"],
+)
 
 use_auto_tx = st.sidebar.checkbox("自動帶入外資台指期淨空單", value=taifex_tx["ok"], disabled=not taifex_tx["ok"])
 if use_auto_tx and taifex_tx["ok"]:
     custom_tx_short = taifex_tx["short_abs"]
-    st.sidebar.info(f"📡 期交所 ({taifex_tx['date']})：淨口數 {taifex_tx['net_oi']:,}（空單 {custom_tx_short:,} 口）")
+    st.sidebar.info(f"📡 {taifex_tx['source']} ({taifex_tx['date']})：空單 {custom_tx_short:,} 口")
 else:
-    if not taifex_tx["ok"]:
-        st.sidebar.caption("⚠️ 期交所外資期貨暫無回應，改用手動輸入")
     custom_tx_short = st.sidebar.number_input("外資台指期未平倉淨空單（口）", value=53072, step=1000)
 
 use_auto_retail = st.sidebar.checkbox("自動換算微台散戶多空比", value=taifex_retail["ok"], disabled=not taifex_retail["ok"])
 if use_auto_retail and taifex_retail["ok"]:
     custom_retail_ratio = taifex_retail["ratio"]
-    st.sidebar.info(f"📡 期交所 TMF ({taifex_retail['date']})：{custom_retail_ratio:+.1f}% (偏多)")
+    st.sidebar.info(f"📡 {taifex_retail['source']} ({taifex_retail['date']})：{custom_retail_ratio:+.1f}% (偏多)")
 else:
-    if not taifex_retail["ok"]:
-        st.sidebar.caption("⚠️ 期交所微台全市場未平倉暫無法取得，請手動輸入")
     custom_retail_ratio = st.sidebar.slider("微台散戶多空比（偏多 %）", min_value=-50.0, max_value=50.0, value=22.0, step=0.5)
 
 use_auto_margin = st.sidebar.checkbox("自動帶入證交所上市融資餘額", value=twse_margin["ok"], disabled=not twse_margin["ok"])
 if use_auto_margin and twse_margin["ok"]:
     custom_margin_debt = twse_margin["value"]
-    st.sidebar.info(f"📡 證交所 ({twse_margin['date']})：{custom_margin_debt:,.1f} 億元")
+    st.sidebar.info(f"📡 {twse_margin['source']} ({twse_margin['date']})：{custom_margin_debt:,.1f} 億元")
 else:
-    if not twse_margin["ok"]:
-        st.sidebar.caption("⚠️ 證交所融資餘額暫無回應，改用手動輸入")
     custom_margin_debt = st.sidebar.number_input("台股上市融資餘額（億元）", value=4911.0, step=50.0)
 
 use_auto_cpi = st.sidebar.checkbox("自動帶入美國 CPI / 核心 CPI", value=us_cpi["ok"], disabled=not us_cpi["ok"])
@@ -544,117 +690,79 @@ if use_auto_cpi and us_cpi["ok"]:
     custom_core_cpi = us_cpi["core_cpi"]
     st.sidebar.info(f"📡 {us_cpi['source']} ({us_cpi['date']})：CPI {custom_cpi}% / 核心 {custom_core_cpi}%")
 else:
-    if not us_cpi["ok"]:
-        st.sidebar.caption("⚠️ 美國 CPI 端點暫無法連線，改用手動輸入")
     custom_cpi = st.sidebar.number_input("美國最新公佈 CPI（%）", value=3.8, step=0.1)
     custom_core_cpi = st.sidebar.number_input("美國最新核心 CPI（%）", value=2.8, step=0.1)
 
 st.sidebar.divider()
-st.sidebar.caption("熱門 ETF 溢價率依各投信盤中淨值變動，建議依觀察標的微調：")
 custom_etf_premium = st.sidebar.slider("熱門 ETF 溢價率（%）", min_value=-2.0, max_value=10.0, value=1.5, step=0.1)
 
 # ===========================
-# 2. 風險綜合評分與判斷建議引擎
+# 2. 雙軌風險綜合評分計算
 # ===========================
 risk_points = 0
 advices = []
 
 if custom_tx_short > 50000:
     risk_points += 2
-    advices.append((
-        "🚨",
-        f"外資期貨淨空單 {custom_tx_short:,} 口（> 5 萬口極限高位）",
-        "外資避險與看空力道極強，權值股與大盤短線面臨較大壓抑。",
-        "避免重倉追漲大盤或大型權值股，待空單明顯回補再加碼。"
-    ))
+    advices.append(("🚨", f"外資期貨淨空單 {custom_tx_short:,} 口（> 5 萬口極限高位）", "外資避險與看空力道極強，權值股與大盤短線面臨較大壓抑。", "避免重倉追漲大盤或大型權值股，待空單明顯回補再加碼。"))
 elif custom_tx_short > 35000:
     risk_points += 1
-    advices.append((
-        "⚠️",
-        f"外資期貨淨空單 {custom_tx_short:,} 口（> 3.5 萬口警戒區）",
-        "法人心態轉趨謹慎，大盤容易出現高檔震盪。",
-        "採逢低分批買進，不追突破紅K。"
-    ))
+    advices.append(("⚠️", f"外資期貨淨空單 {custom_tx_short:,} 口（> 3.5 萬口警戒區）", "法人心態轉趨謹慎，大盤容易出現高檔震盪。", "採逢低分批買進，不追突破紅K。"))
 
 if custom_retail_ratio > 20:
     risk_points += 2
-    advices.append((
-        "🚨",
-        f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 20% 強烈反指標）",
-        "散戶高度一致做多，籌碼凌亂，行情急跌時容易出現「多殺多」洗盤。",
-        "切勿跟風開槓桿做多，耐心等待急跌洗盤後再找承接點。"
-    ))
+    advices.append(("🚨", f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 20% 強烈反指標）", "散戶高度一致做多，籌碼凌亂，行情急跌時容易出現「多殺多」洗盤。", "切勿跟風開槓桿做多，耐心等待急跌洗盤後再找承接點。"))
 elif custom_retail_ratio > 10:
     risk_points += 1
-    advices.append((
-        "⚠️",
-        f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 10% 偏熱）",
-        "散戶作多意願升溫，短線波動可能放大。",
-        "縮小單筆投入金額，分批進場為主。"
-    ))
+    advices.append(("⚠️", f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 10% 偏熱）", "散戶作多意願升溫，短線波動可能放大。", "縮小單筆投入金額，分批進場為主。"))
 
 if custom_margin_debt > 4800:
     risk_points += 2
-    advices.append((
-        "🚨",
-        f"上市融資餘額 {custom_margin_debt:,.1f} 億元（> 4,800 億高槓桿）",
-        "市場借錢買股水位過高，若遇急跌易觸發融資追繳與斷頭連鎖賣壓。",
-        "自己絕不使用融資買股，並避開近期融資暴增的中小型飆股。"
-    ))
+    advices.append(("🚨", f"上市融資餘額 {custom_margin_debt:,.1f} 億元（> 4,800 億高槓桿）", "市場借錢買股水位過高，若遇急跌易觸發融資追繳與斷頭連鎖賣壓。", "自己絕不使用融資買股，並避開近期融資暴增的中小型飆股。"))
 
 if custom_etf_premium > 3.0:
     risk_points += 1
-    advices.append((
-        "⚠️",
-        f"熱門 ETF 溢價 {custom_etf_premium}%（> 3% 明顯過熱）",
-        "市價已大幅高於淨值，此時買進等於一進場就多付溢價成本。",
-        "暫停買進高溢價 ETF，等溢價收斂至 1% 以內再考慮；持有者可評估適度減碼。"
-    ))
+    advices.append(("⚠️", f"熱門 ETF 溢價 {custom_etf_premium}%（> 3% 明顯過熱）", "市價已大幅高於淨值，此時買進等於一進場就多付溢價成本。", "暫停買進高溢價 ETF，等溢價收斂至 1% 以內再考慮。"))
 
 if custom_cpi >= 3.8:
     risk_points += 2
-    advices.append((
-        "🚨",
-        f"美國 CPI {custom_cpi}%（≥ 3.8% 通膨黏滯）",
-        "通膨降溫受阻，降息空間受限甚至有緊縮預期，高估值股票容易面臨修正。",
-        "降低高本益比科技股比重，增加現金或高股息／防禦型資產比例。"
-    ))
+    advices.append(("🚨", f"美國 CPI {custom_cpi}%（≥ 3.8% 通膨黏滯）", "通膨降溫受阻，降息空間受限甚至有緊縮預期，高估值股票容易面臨修正。", "降低高本益比科技股比重，增加現金或高股息／防禦型資產比例。"))
 
 wti_price = market_data["WTI 紐約原油"]["price"]
 if wti_price >= 100:
     risk_points += 2
-    advices.append((
-        "🚨",
-        f"WTI 原油 ${wti_price:.2f}（突破 100 美元大關）",
-        "能源成本飆升將推升二次通膨壓力，壓抑企業獲利與消費動能。",
-        "提高現金防守比例，避開高耗能、高運輸成本受衝擊產業。"
-    ))
+    advices.append(("🚨", f"WTI 原油 ${wti_price:.2f}（突破 100 美元大關）", "能源成本飆升將推升二次通膨壓力，壓抑企業獲利與消費動能。", "提高現金防守比例，避開高耗能產業。"))
 elif wti_price >= 85:
     risk_points += 1
-    advices.append((
-        "⚠️",
-        f"WTI 原油 ${wti_price:.2f}（處於 85~100 美元偏高區）",
-        "油價維持高檔，通膨回落速度可能放緩。",
-        "持續關注下一次美國 CPI 公布值，暫不擴大槓桿。"
-    ))
+    advices.append(("⚠️", f"WTI 原油 ${wti_price:.2f}（處於 85~100 美元偏高區）", "油價維持高檔，通膨回落速度可能放緩。", "持續關注下一次美國 CPI 公布值，暫不擴大槓桿。"))
 
 vix_val = market_data["VIX 恐慌指數"]["price"]
 if 0 < vix_val < 18:
     risk_points += 1
-    advices.append((
-        "⚠️",
-        f"VIX 指數 {vix_val:.2f}（< 18 市場過度樂觀）",
-        "市場避險情緒極低，代表多數人毫無防備，遇到突發利空時回檔速度會特別快。",
-        "檢查手中持股的停利與停損點，保留緊急備用現金。"
-    ))
+    advices.append(("⚠️", f"VIX 指數 {vix_val:.2f}（< 18 市場過度樂觀）", "市場避險情緒極低，遇到突發利空時回檔速度會特別快。", "檢查手中持股的停利與停損點，保留緊急備用現金。"))
 
-total_risk_score = min(int((risk_points / 12) * 100), 100)
+fixed_score = min(int((risk_points / 12) * 100), 100)
+
+# 若已有 chips_history.csv >= 10 天，加入融資歷史百分位
+if not chips_df.empty and chips_df["margin_debt"].dropna().shape[0] >= 10:
+    m_series = chips_df["margin_debt"].dropna()
+    dyn_pcts["上市融資歷史百分位"] = round(float((m_series <= custom_margin_debt).mean() * 100), 1)
+
+dynamic_score = int(round(sum(dyn_pcts.values()) / len(dyn_pcts))) if dyn_pcts else fixed_score
+
+if score_mode.startswith("混合"):
+    total_risk_score = int(round(0.6 * fixed_score + 0.4 * dynamic_score))
+elif score_mode.startswith("傳統"):
+    total_risk_score = fixed_score
+else:
+    total_risk_score = dynamic_score
 
 # ===========================
-# 分頁架構：大盤風險 / 個股買賣診斷 / 庫存截圖健檢
+# 分頁架構（4 大分頁）
 # ===========================
-tab_macro, tab_stock, tab_portfolio = st.tabs([
-    "📊 大盤過熱與總經監控",
+tab_macro, tab_backtest, tab_stock, tab_portfolio = st.tabs([
+    "📊 大盤過熱與籌碼趨勢",
+    "📈 歷史回測驗證",
     "🔍 個股買進／賣出診斷",
     "📸 庫存持股截圖健檢",
 ])
@@ -672,55 +780,83 @@ with tab_macro:
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {
-                        "color": "#D9534F"
-                        if total_risk_score > 65
-                        else "#F0AD4E"
-                        if total_risk_score > 40
-                        else "#5CB85C"
+                        "color": "#D9534F" if total_risk_score > 65 else "#F0AD4E" if total_risk_score > 40 else "#5CB85C"
                     },
                     "steps": [
                         {"range": [0, 40], "color": "#e8f5e9"},
                         {"range": [40, 65], "color": "#fff9c4"},
                         {"range": [65, 100], "color": "#ffebee"},
                     ],
-                    "threshold": {
-                        "line": {"color": "red", "width": 4},
-                        "thickness": 0.75,
-                        "value": 75,
-                    },
+                    "threshold": {"line": {"color": "red", "width": 4}, "thickness": 0.75, "value": 75},
                 },
             )
         )
         fig_gauge.update_layout(height=250, margin=dict(l=30, r=35, t=45, b=20))
         st.plotly_chart(fig_gauge, use_container_width=True)
+        st.caption(f"固定門檻：{fixed_score} 分 ｜ 動態歷史百分位：{dynamic_score} 分")
 
     with col_score2:
         st.subheader("🧭 目前綜合判斷與操作建議")
         if total_risk_score > 65:
             st.error(
                 "**【紅燈｜高風險警戒區（> 65 分）】市場過熱且籌碼／總經風險偏高**\n\n"
-                "* **建議水位**：股票部位降至 **30%～50%**，預留 **50%～70% 現金**（或高流動性定存／短債）。\n"
-                "* **核心動作**：**停止追高與開槓桿**；漲多且破線的標的逢彈分批減碼，耐心等風險降溫或急跌洗盤後再進場。"
+                "* **建議水位**：股票部位降至 **30%～50%**，預留 **50%～70% 現金**。\n"
+                "* **核心動作**：**停止追高與開槓桿**；漲多且破線的標的逢彈分批減碼。"
             )
         elif total_risk_score > 40:
             st.warning(
                 "**【黃燈｜中度警戒區（41～65 分）】部分指標偏熱，高檔震盪機率高**\n\n"
-                "* **建議水位**：持股 **50%～70%**、現金 **30%～50%**，保持進可攻退可守。\n"
-                "* **核心動作**：**買黑不買紅**，避免單筆重押與追高溢價 ETF，以定期定額或分批低接取代追價。"
+                "* **建議水位**：持股 **50%～70%**、現金 **30%～50%**。\n"
+                "* **核心動作**：**買黑不買紅**，避免單筆重押與追高溢價 ETF。"
             )
         else:
             st.success(
                 "**【綠燈｜穩健安全區（0～40 分）】籌碼與總經環境相對平穩**\n\n"
-                "* **建議水位**：可維持正常偏多配置（持股 **70%～85%**、彈性現金 **15%～30%**）。\n"
-                "* **核心動作**：依既定投資紀律分批布局或定期定額，持續每週檢視指標變化即可。"
+                "* **建議水位**：可維持正常偏多配置（持股 **70%～85%**、現金 **15%～30%**）。\n"
+                "* **核心動作**：依既定紀律分批布局或定期定額。"
             )
-        st.caption("※ 備註：以上建議依本儀表板量化門檻自動生成，僅供個人風險控管與部位配置參考。")
+
+        if dyn_pcts:
+            pct_text = " ｜ ".join(f"**{k}**：{v}%" for k, v in dyn_pcts.items())
+            st.caption(f"📐 近一年歷史百分位參考（越高代表越處於警戒水位）：{pct_text}")
 
     if advices:
         with st.expander(f"📋 點此查看目前觸發的 {len(advices)} 項警訊白話解讀與對應做法", expanded=True):
             for icon, title, meaning, action in advices:
-                st.markdown(f"**{icon} {title}**")
-                st.markdown(f"- **代表意義**：{meaning}\n- **建議做法**：{action}")
+                st.markdown(f"**{icon} {title}**\n- **代表意義**：{meaning}\n- **建議做法**：{action}")
+
+    st.divider()
+
+    # 台股籌碼歷史走勢圖（讀取 chips_history.csv）
+    st.markdown("### 📉 台股籌碼歷史走勢圖（外資空單 / 融資餘額 / 微台散戶）")
+    if chips_df.empty:
+        st.info(
+            "尚未偵測到 `chips_history.csv` 歷史存檔。請將一併產出的 `fetch_daily_chips.py` 與 "
+            "`.github/workflows/daily_chips.yml` 上傳到 GitHub 並在 Actions 執行一次，即可自動回補並每日累積歷史走勢！"
+        )
+    else:
+        chip_col1, chip_col2 = st.columns(2)
+        with chip_col1:
+            df_m = chips_df.dropna(subset=["margin_debt"])
+            if not df_m.empty:
+                fig_m = go.Figure()
+                fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["margin_debt"], name="上市融資餘額(億)", line=dict(color="#d9534f", width=2.2)))
+                fig_m.add_hline(y=4800, line_dash="dash", line_color="gray", annotation_text="4,800億警戒線")
+                fig_m.update_layout(title="上市融資餘額歷史走勢（億元）", height=320, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig_m, use_container_width=True)
+            else:
+                st.caption("尚無融資餘額歷史紀錄。")
+
+        with chip_col2:
+            df_tx = chips_df.dropna(subset=["tx_foreign_short"])
+            if not df_tx.empty:
+                fig_tx = go.Figure()
+                fig_tx.add_trace(go.Bar(x=df_tx["date"], y=df_tx["tx_foreign_short"], name="外資淨空單(口)", marker_color="#f0ad4e"))
+                fig_tx.add_hline(y=50000, line_dash="dash", line_color="red", annotation_text="5萬口極限高位")
+                fig_tx.update_layout(title="外資台指期淨空單歷史紀錄（口）", height=320, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig_tx, use_container_width=True)
+            else:
+                st.info("期交所每日累積中：待 GitHub Actions 每天 16:00 執行後，外資空單長條圖就會逐日累積顯示。")
 
     st.divider()
     st.subheader("📌 即時盤面與跨市場指標一覽（Yahoo Finance）")
@@ -736,12 +872,9 @@ with tab_macro:
     for col, (label, prefix, item) in zip(cols, cards):
         with col:
             st.metric(label, f"{prefix}{item['price']:.2f}", f"{item['change']:.2f}%")
-            status_icon = "✅" if item["ok"] else "❌"
-            st.caption(f"{status_icon} 資料日期：{item['date']}")
+            st.caption(f"{'✅' if item['ok'] else '❌'} 資料日期：{item['date']}")
 
-    # ===========================
-    # 新增：管理指標走勢圖（日／週／月）
-    # ===========================
+    # 關鍵市場指標走勢圖（日／週／月）
     st.markdown("### 📈 關鍵市場指標走勢圖（日／週／月）")
     trend_options = {
         "台灣加權指數 (^TWII)": ("^TWII", None, None),
@@ -764,105 +897,48 @@ with tab_macro:
 
     if trend_df is not None and not trend_df.empty:
         fig_trend = go.Figure()
-        fig_trend.add_trace(
-            go.Scatter(
-                x=trend_df.index,
-                y=trend_df["Close"],
-                name="收盤價",
-                line=dict(color="#1f77b4", width=2.2),
-            )
-        )
+        fig_trend.add_trace(go.Scatter(x=trend_df.index, y=trend_df["Close"], name="收盤價", line=dict(color="#1f77b4", width=2.2)))
         if trend_df["MA_S"].notna().any():
-            fig_trend.add_trace(
-                go.Scatter(
-                    x=trend_df.index,
-                    y=trend_df["MA_S"],
-                    name=tf_cfg["ma_s_name"],
-                    line=dict(color="#ff7f0e", width=1.4),
-                )
-            )
+            fig_trend.add_trace(go.Scatter(x=trend_df.index, y=trend_df["MA_S"], name=tf_cfg["ma_s_name"], line=dict(color="#ff7f0e", width=1.4)))
         if trend_df["MA_L"].notna().any():
-            fig_trend.add_trace(
-                go.Scatter(
-                    x=trend_df.index,
-                    y=trend_df["MA_L"],
-                    name=tf_cfg["ma_l_name"],
-                    line=dict(color="#2ca02c", width=1.4),
-                )
-            )
+            fig_trend.add_trace(go.Scatter(x=trend_df.index, y=trend_df["MA_L"], name=tf_cfg["ma_l_name"], line=dict(color="#2ca02c", width=1.4)))
         if warn_val is not None:
-            fig_trend.add_hline(
-                y=warn_val,
-                line_dash="dash",
-                line_color="red",
-                annotation_text=warn_label,
-            )
-        fig_trend.update_layout(
-            title=f"{selected_trend} — {selected_tf}走勢（{tf_cfg['period']}）",
-            height=360,
-            margin=dict(l=20, r=20, t=45, b=20),
-            hovermode="x unified",
-        )
+            fig_trend.add_hline(y=warn_val, line_dash="dash", line_color="red", annotation_text=warn_label)
+        fig_trend.update_layout(title=f"{selected_trend} — {selected_tf}走勢（{tf_cfg['period']}）", height=350, margin=dict(l=20, r=20, t=45, b=20), hovermode="x unified")
         st.plotly_chart(fig_trend, use_container_width=True)
+
+
+with tab_backtest:
+    st.subheader("📈 風險燈號策略歷史回測驗證（T+1 執行，含台股手續費與證交稅）")
+    st.caption("驗證過去數年「依歷史百分位風險燈號自動加減碼」vs「單純買進持有 (Buy & Hold)」的報酬與抗跌表現。")
+
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    with bc1:
+        bt_ticker = st.selectbox("回測標的", ["0050.TW", "^TWII", "2330.TW", "^GSPC"])
+    with bc2:
+        bt_years = st.selectbox("回測年數", [3, 5], index=1)
+    with bc3:
+        bt_red = st.slider("紅燈時保留持股比例", 0.0, 0.8, 0.4, 0.1)
+    with bc4:
+        bt_yellow = st.slider("黃燈時保留持股比例", 0.3, 1.0, 0.7, 0.1)
+
+    bt_res = run_strategy_backtest(bt_ticker, bt_years, bt_red, bt_yellow)
+    if bt_res:
+        bh, strat = bt_res["bh"], bt_res["strat"]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("策略累積報酬 vs 大盤", f"{strat['total_ret']:.1f}%", f"大盤 {bh['total_ret']:.1f}%")
+        k2.metric("年化報酬率 (CAGR)", f"{strat['cagr']:.1f}%", f"大盤 {bh['cagr']:.1f}%")
+        k3.metric("最大回撤 (Max Drawdown)", f"{strat['mdd']:.1f}%", f"大盤 {bh['mdd']:.1f}%")
+        k4.metric("夏普值 (風險調整報酬)", f"{strat['sharpe']:.2f}", f"大盤 {bh['sharpe']:.2f}（調倉 {bt_res['rebalances']} 次）")
+
+        bt_df = bt_res["df"]
+        fig_bt = go.Figure()
+        fig_bt.add_trace(go.Scatter(x=bt_df.index, y=bt_df["strat_nav"], name="動態風險控管策略", line=dict(color="#d9534f", width=2.3)))
+        fig_bt.add_trace(go.Scatter(x=bt_df.index, y=bt_df["bh_nav"], name=f"{bt_ticker} 買進持有", line=dict(color="#1f77b4", width=1.8, dash="dot")))
+        fig_bt.update_layout(title=f"{bt_ticker} 淨值曲線比較（初始淨值 = 1.0）", height=380, margin=dict(l=20, r=20, t=45, b=20), hovermode="x unified")
+        st.plotly_chart(fig_bt, use_container_width=True)
     else:
-        st.info("暫時無法取得該指標的歷史走勢資料，請稍後再試。")
-
-    st.markdown("### 🔍 核心指標對照與資料來源驗證")
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.markdown("#### 1. 籌碼與資金結構")
-        df_chip = pd.DataFrame(
-            {
-                "指標名稱": ["外資期貨淨空單", "微台散戶多空比", "上市融資餘額", "熱門 ETF 溢價率"],
-                "當前數值": [
-                    f"{custom_tx_short:,} 口",
-                    f"{custom_retail_ratio:+.1f}% (偏多)",
-                    f"{custom_margin_debt:,.1f} 億元",
-                    f"{custom_etf_premium}%",
-                ],
-                "資料來源 / 日期": [
-                    f"{taifex_tx['source']} ({taifex_tx['date']})" if (use_auto_tx and taifex_tx["ok"]) else "手動輸入",
-                    f"{taifex_retail['source']} ({taifex_retail['date']})" if (use_auto_retail and taifex_retail["ok"]) else "手動輸入",
-                    f"{twse_margin['source']} ({twse_margin['date']})" if (use_auto_margin and twse_margin["ok"]) else "手動輸入",
-                    "手動輸入",
-                ],
-                "當前警示燈號": [
-                    "🔴 極度危險" if custom_tx_short > 50000 else "🟡 警戒" if custom_tx_short > 35000 else "🟢 正常",
-                    "🔴 極度反指標" if custom_retail_ratio > 20 else "🟡 偏熱" if custom_retail_ratio > 10 else "🟢 正常",
-                    "🔴 嚴重過熱" if custom_margin_debt > 4800 else "🟢 正常",
-                    "🔴 嚴重溢價" if custom_etf_premium > 3.0 else "🟢 合理",
-                ],
-            }
-        )
-        st.table(df_chip)
-
-    with col_b:
-        st.markdown("#### 2. 通膨與總體經濟")
-        df_macro = pd.DataFrame(
-            {
-                "指標名稱": ["美國最新 CPI", "美國核心 CPI", "WTI 原油現價", "VIX 避險意識"],
-                "當前數值": [
-                    f"{custom_cpi}%",
-                    f"{custom_core_cpi}%",
-                    f"${market_data['WTI 紐約原油']['price']:.2f}",
-                    f"{market_data['VIX 恐慌指數']['price']:.2f}",
-                ],
-                "資料來源 / 日期": [
-                    f"{us_cpi['source']} ({us_cpi['date']})" if (use_auto_cpi and us_cpi["ok"]) else "手動輸入",
-                    f"{us_cpi['source']} ({us_cpi['date']})" if (use_auto_cpi and us_cpi["ok"]) else "手動輸入",
-                    f"Yahoo Finance ({market_data['WTI 紐約原油']['date']})",
-                    f"Yahoo Finance ({market_data['VIX 恐慌指數']['date']})",
-                ],
-                "當前警示燈號": [
-                    "🔴 重啟升息風險" if custom_cpi >= 3.8 else "🟡 偏高" if custom_cpi >= 3.0 else "🟢 溫和",
-                    "🔴 核心黏滯" if custom_core_cpi >= 2.8 else "🟢 溫和",
-                    "🔴 油價破百" if market_data["WTI 紐約原油"]["price"] >= 100 else "🟢 正常",
-                    "🟡 忽視風險" if 0 < market_data["VIX 恐慌指數"]["price"] < 18 else "🟢 警覺",
-                ],
-            }
-        )
-        st.table(df_macro)
+        st.warning("無法取得足夠的歷史回測資料，請稍後再試。")
 
 
 with tab_stock:
@@ -882,20 +958,14 @@ with tab_stock:
     if target_sym:
         stock_info = analyze_single_stock(target_sym)
         if not stock_info:
-            st.error(f"找不到代號 `{target_sym}` 的報價資料，請確認代號是否正確（台股可只輸入數字如 `2330`）。")
+            st.error(f"找不到代號 `{target_sym}` 的報價資料。")
         else:
             signal, summary, action, pnl_pct = evaluate_stock_action(stock_info, total_risk_score, cost_input)
             m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric(f"{stock_info['symbol']} 最新價", f"{stock_info['price']:.2f}", f"{stock_info['pct_chg']:.2f}%")
-                st.caption(f"資料日期：{stock_info['date']}")
-            with m2:
-                st.metric("20 日月線 (MA20)", f"{stock_info['ma20']:.2f}", f"乖離 {stock_info['bias20']:+.2f}%")
-            with m3:
-                ma60_txt = f"{stock_info['ma60']:.2f}" if stock_info["ma60"] else "資料不足"
-                st.metric("60 日季線 (MA60)", ma60_txt)
-            with m4:
-                st.metric("14 日 RSI 強弱", f"{stock_info['rsi14']:.1f}", f"量比 {stock_info['vol_ratio']:.2f}x")
+            m1.metric(f"{stock_info['symbol']} 最新價", f"{stock_info['price']:.2f}", f"{stock_info['pct_chg']:.2f}%")
+            m2.metric("20 日月線 (MA20)", f"{stock_info['ma20']:.2f}", f"乖離 {stock_info['bias20']:+.2f}%")
+            m3.metric("60 日季線 (MA60)", f"{stock_info['ma60']:.2f}" if stock_info["ma60"] else "資料不足")
+            m4.metric("14 日 RSI 強弱", f"{stock_info['rsi14']:.1f}", f"量比 {stock_info['vol_ratio']:.2f}x")
 
             pnl_msg = f" ｜ 帳面報酬率：**{pnl_pct:+.2f}%**" if pnl_pct is not None else ""
             st.info(f"### {signal}{pnl_msg}\n\n* **技術與大盤判讀**：{summary}\n* **建議做法**：{action}")
@@ -922,12 +992,7 @@ with tab_portfolio:
     except Exception:
         secret_key = ""
 
-    api_key_input = st.text_input(
-        "Gemini API Key（建議於 Streamlit Cloud Secrets 設定 `GEMINI_API_KEY`，就不用每次輸入）",
-        value=secret_key,
-        type="password",
-    )
-
+    api_key_input = st.text_input("Gemini API Key", value=secret_key, type="password")
     uploaded_img = st.file_uploader("上傳庫存持股相片／截圖（PNG、JPG）", type=["png", "jpg", "jpeg", "webp"])
 
     if uploaded_img is not None:
@@ -935,14 +1000,9 @@ with tab_portfolio:
         pil_img = Image.open(uploaded_img)
         with img_col1:
             st.image(pil_img, caption="已上傳的庫存截圖", use_container_width=True)
-
         with img_col2:
             if not api_key_input:
-                st.warning(
-                    "尚未設定 `GEMINI_API_KEY`。\n\n"
-                    "請至 Google AI Studio 取得免費 API Key，並在 Streamlit Cloud 專案的 **Settings → Secrets** 加入：\n"
-                    '`GEMINI_API_KEY = "你的金鑰"`（或先貼在上方密碼欄測試）。'
-                )
+                st.warning("尚未設定 `GEMINI_API_KEY`，請於 Streamlit Cloud Secrets 加入或貼於上方密碼欄。")
             else:
                 if st.button("🤖 辨識截圖並進行持股健檢", type="primary"):
                     with st.spinner("正在辨識圖片中的持股並抓取最新市場報價..."):
