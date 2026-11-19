@@ -59,9 +59,52 @@ def fetch_global_market_data():
 
 
 @st.cache_data(ttl=43200)  # 美國 CPI 為月度數據，快取 12 小時
-def fetch_fred_us_cpi():
-    """免 API Key 從聖路易斯聯準銀行 (FRED) 抓取美國最新 CPI 與核心 CPI 年增率 (%)"""
-    def _get_yoy(series_id: str):
+def fetch_us_cpi_data():
+    """免 API Key 抓取美國最新 CPI 與核心 CPI 年增率 (%)：優先用 BLS 官方 API v1，備援用 FRED CSV"""
+    now_year = datetime.now().year
+    # 1) 優先使用美國勞工統計局 BLS Public API v1
+    try:
+        bls_url = "https://api.bls.gov/publicAPI/v1/timeseries/data/"
+        payload = {
+            "seriesid": ["CUSR0000SA0", "CUSR0000SA0L1E"],
+            "startyear": str(now_year - 2),
+            "endyear": str(now_year),
+        }
+        resp = requests.post(bls_url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+        if resp.status_code == 200:
+            js = resp.json()
+            if js.get("status") == "REQUEST_SUCCEEDED":
+                series_map = {}
+                for s in js.get("Results", {}).get("series", []):
+                    sid = s.get("seriesID")
+                    rows = []
+                    for item in s.get("data", []):
+                        period = item.get("period", "")
+                        if period.startswith("M") and period != "M13":
+                            ym = f"{item['year']}-{period[1:]}"
+                            try:
+                                rows.append((ym, float(item["value"])))
+                            except ValueError:
+                                pass
+                    rows.sort(key=lambda x: x[0])
+                    if len(rows) >= 13:
+                        latest_ym, latest_val = rows[-1]
+                        prev_val = rows[-13][1]
+                        yoy = round(((latest_val / prev_val) - 1) * 100, 2)
+                        series_map[sid] = (yoy, latest_ym)
+                if "CUSR0000SA0" in series_map and "CUSR0000SA0L1E" in series_map:
+                    return {
+                        "cpi": series_map["CUSR0000SA0"][0],
+                        "core_cpi": series_map["CUSR0000SA0L1E"][0],
+                        "date": series_map["CUSR0000SA0"][1],
+                        "ok": True,
+                        "source": "美國勞工局 (BLS)",
+                    }
+    except Exception:
+        pass
+
+    # 2) 備援：FRED 公開 CSV
+    def _get_fred_yoy(series_id: str):
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         resp.raise_for_status()
@@ -73,23 +116,24 @@ def fetch_fred_us_cpi():
             latest = float(df[val_col].iloc[-1])
             prev_yr = float(df[val_col].iloc[-13])
             yoy = round(((latest / prev_yr) - 1) * 100, 2)
-            obs_month = str(df[date_col].iloc[-1])[:7]  # YYYY-MM
+            obs_month = str(df[date_col].iloc[-1])[:7]
             return yoy, obs_month
         return None, None
 
     try:
-        cpi_yoy, cpi_date = _get_yoy("CPIAUCSL")
-        core_yoy, core_date = _get_yoy("CPILFESL")
+        cpi_yoy, cpi_date = _get_fred_yoy("CPIAUCSL")
+        core_yoy, core_date = _get_fred_yoy("CPILFESL")
         if cpi_yoy is not None and core_yoy is not None:
             return {
                 "cpi": cpi_yoy,
                 "core_cpi": core_yoy,
                 "date": cpi_date or core_date,
                 "ok": True,
-                "source": "美國聯準會 FRED",
+                "source": "美國聯準會 (FRED)",
             }
     except Exception:
         pass
+
     return {"cpi": None, "core_cpi": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
 
 
@@ -134,25 +178,32 @@ def fetch_twse_margin_debt():
 
 
 def _extract_net_oi_from_record(item: dict):
-    """從期交所三大法人單筆紀錄中解析未平倉淨口數"""
+    """從期交所三大法人單筆紀錄中解析未平倉淨口數（嚴格排除契約金額 Value 欄位）"""
+    def _is_value_col(key: str) -> bool:
+        kl = key.lower()
+        return any(bad in kl for bad in ("value", "amount", "金額", "價值", "contractvalue"))
+
     for k, v in item.items():
+        if _is_value_col(k):
+            continue
         kl = k.lower()
-        if ("net" in kl and "openinterest" in kl and ("contract" in kl or "lot" in kl or "volume" in kl)) or (
-            "多空淨額" in k and "未平倉" in k and "口數" in k
-        ):
+        if ("net" in kl and "openinterest" in kl and "lot" in kl) or ("多空淨額" in k and "未平倉" in k and "口數" in k):
             try:
                 return int(str(v).replace(",", "").strip())
             except ValueError:
                 pass
+
     long_oi, short_oi = None, None
     for k, v in item.items():
+        if _is_value_col(k):
+            continue
         kl = k.lower()
-        if ("long" in kl and "openinterest" in kl and "contract" in kl) or ("多方" in k and "未平倉" in k and "口數" in k):
+        if ("long" in kl and "openinterest" in kl and "lot" in kl) or ("多方" in k and "未平倉" in k and "口數" in k):
             try:
                 long_oi = int(str(v).replace(",", "").strip())
             except ValueError:
                 pass
-        if ("short" in kl and "openinterest" in kl and "contract" in kl) or ("空方" in k and "未平倉" in k and "口數" in k):
+        if ("short" in kl and "openinterest" in kl and "lot" in kl) or ("空方" in k and "未平倉" in k and "口數" in k):
             try:
                 short_oi = int(str(v).replace(",", "").strip())
             except ValueError:
@@ -167,7 +218,10 @@ def fetch_taifex_futures_data():
     """從臺灣期貨交易所 OpenAPI 抓取：1) 外資大台淨空單 2) 微台三大法人淨部位與散戶多空比"""
     headers = {"User-Agent": "Mozilla/5.0"}
     inst_url = "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate"
-    daily_url = "https://openapi.taifex.com.tw/v1/DailyMarketReport"
+    daily_urls = [
+        "https://openapi.taifex.com.tw/v1/DailyMarketReportFut",
+        "https://openapi.taifex.com.tw/v1/DailyMarketReport",
+    ]
 
     foreign_tx = {"net_oi": None, "short_abs": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
     retail_tmf = {"ratio": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
@@ -210,11 +264,15 @@ def fetch_taifex_futures_data():
 
                 # 若找到微台三大法人合計，再抓全市場微台總未平倉口數計算散戶多空比
                 if tmf_found:
-                    try:
-                        d_resp = requests.get(daily_url, headers=headers, timeout=8)
-                        if d_resp.status_code == 200:
+                    total_tmf_oi = 0
+                    for d_url in daily_urls:
+                        try:
+                            d_resp = requests.get(d_url, headers=headers, timeout=8)
+                            if d_resp.status_code != 200:
+                                continue
                             d_records = d_resp.json()
-                            total_tmf_oi = 0
+                            if not isinstance(d_records, list):
+                                continue
                             for d_item in d_records:
                                 contract = str(d_item.get("Contract") or d_item.get("契約") or "").strip().upper()
                                 session = str(d_item.get("TradingSession") or d_item.get("交易時段") or "")
@@ -225,16 +283,40 @@ def fetch_taifex_futures_data():
                                     except ValueError:
                                         pass
                             if total_tmf_oi > 0:
-                                retail_net = -tmf_inst_net
-                                ratio_pct = round((retail_net / total_tmf_oi) * 100, 1)
-                                retail_tmf = {
-                                    "ratio": ratio_pct,
-                                    "date": tmf_date,
-                                    "ok": True,
-                                    "source": "臺灣期交所換算 (TMF)",
-                                }
-                    except Exception:
-                        pass
+                                break
+                        except Exception:
+                            continue
+
+                    # 備援：期交所官方 CSV 下載（針對 TMF）
+                    if total_tmf_oi == 0:
+                        try:
+                            csv_url = "https://www.taifex.com.tw/cht/3/dlFutDataDown"
+                            q_date = tmf_date.replace("-", "/") if "-" in tmf_date else datetime.now().strftime("%Y/%m/%d")
+                            form = {
+                                "down_type": "1",
+                                "commodity_id": "TMF",
+                                "queryStartDate": q_date,
+                                "queryEndDate": q_date,
+                            }
+                            c_resp = requests.post(csv_url, data=form, headers=headers, timeout=8)
+                            if c_resp.status_code == 200 and "未沖銷契約數" in c_resp.text:
+                                df_csv = pd.read_csv(io.StringIO(c_resp.text))
+                                if "未沖銷契約數" in df_csv.columns:
+                                    if "交易時段" in df_csv.columns:
+                                        df_csv = df_csv[df_csv["交易時段"].astype(str).str.contains("一般", na=False)]
+                                    total_tmf_oi = int(pd.to_numeric(df_csv["未沖銷契約數"], errors="coerce").fillna(0).sum())
+                        except Exception:
+                            pass
+
+                    if total_tmf_oi > 0:
+                        retail_net = -tmf_inst_net
+                        ratio_pct = round((retail_net / total_tmf_oi) * 100, 1)
+                        retail_tmf = {
+                            "ratio": ratio_pct,
+                            "date": tmf_date,
+                            "ok": True,
+                            "source": "臺灣期交所換算 (TMF)",
+                        }
     except Exception:
         pass
 
@@ -398,7 +480,7 @@ with ctrl_col1:
 market_data = fetch_global_market_data()
 twse_margin = fetch_twse_margin_debt()
 taifex_tx, taifex_retail = fetch_taifex_futures_data()
-fred_cpi = fetch_fred_us_cpi()
+us_cpi = fetch_us_cpi_data()
 
 with ctrl_col2:
     st.caption(
@@ -406,7 +488,7 @@ with ctrl_col2:
         f"融資：{'✅ ' + twse_margin['date'] if twse_margin['ok'] else '⚠️ 手動'} ｜ "
         f"外資期貨：{'✅ ' + str(taifex_tx['date']) if taifex_tx['ok'] else '⚠️ 手動'} ｜ "
         f"微台散戶：{'✅ ' + str(taifex_retail['date']) if taifex_retail['ok'] else '⚠️ 手動'} ｜ "
-        f"美國CPI：{'✅ ' + str(fred_cpi['date']) if fred_cpi['ok'] else '⚠️ 手動'}"
+        f"美國CPI：{'✅ ' + str(us_cpi['date']) if us_cpi['ok'] else '⚠️ 手動'}"
     )
 
 # ===========================
@@ -420,6 +502,8 @@ if use_auto_tx and taifex_tx["ok"]:
     custom_tx_short = taifex_tx["short_abs"]
     st.sidebar.info(f"📡 期交所 ({taifex_tx['date']})：淨口數 {taifex_tx['net_oi']:,}（空單 {custom_tx_short:,} 口）")
 else:
+    if not taifex_tx["ok"]:
+        st.sidebar.caption("⚠️ 期交所外資期貨暫無回應，改用手動輸入")
     custom_tx_short = st.sidebar.number_input("外資台指期未平倉淨空單（口）", value=53072, step=1000)
 
 use_auto_retail = st.sidebar.checkbox("自動換算微台散戶多空比", value=taifex_retail["ok"], disabled=not taifex_retail["ok"])
@@ -427,6 +511,8 @@ if use_auto_retail and taifex_retail["ok"]:
     custom_retail_ratio = taifex_retail["ratio"]
     st.sidebar.info(f"📡 期交所 TMF ({taifex_retail['date']})：{custom_retail_ratio:+.1f}% (偏多)")
 else:
+    if not taifex_retail["ok"]:
+        st.sidebar.caption("⚠️ 期交所微台全市場未平倉暫無法取得，請手動輸入")
     custom_retail_ratio = st.sidebar.slider("微台散戶多空比（偏多 %）", min_value=-50.0, max_value=50.0, value=22.0, step=0.5)
 
 use_auto_margin = st.sidebar.checkbox("自動帶入證交所上市融資餘額", value=twse_margin["ok"], disabled=not twse_margin["ok"])
@@ -434,14 +520,18 @@ if use_auto_margin and twse_margin["ok"]:
     custom_margin_debt = twse_margin["value"]
     st.sidebar.info(f"📡 證交所 ({twse_margin['date']})：{custom_margin_debt:,.1f} 億元")
 else:
+    if not twse_margin["ok"]:
+        st.sidebar.caption("⚠️ 證交所融資餘額暫無回應，改用手動輸入")
     custom_margin_debt = st.sidebar.number_input("台股上市融資餘額（億元）", value=4911.0, step=50.0)
 
-use_auto_cpi = st.sidebar.checkbox("自動帶入美國 CPI / 核心 CPI", value=fred_cpi["ok"], disabled=not fred_cpi["ok"])
-if use_auto_cpi and fred_cpi["ok"]:
-    custom_cpi = fred_cpi["cpi"]
-    custom_core_cpi = fred_cpi["core_cpi"]
-    st.sidebar.info(f"📡 聯準會 FRED ({fred_cpi['date']})：CPI {custom_cpi}% / 核心 {custom_core_cpi}%")
+use_auto_cpi = st.sidebar.checkbox("自動帶入美國 CPI / 核心 CPI", value=us_cpi["ok"], disabled=not us_cpi["ok"])
+if use_auto_cpi and us_cpi["ok"]:
+    custom_cpi = us_cpi["cpi"]
+    custom_core_cpi = us_cpi["core_cpi"]
+    st.sidebar.info(f"📡 {us_cpi['source']} ({us_cpi['date']})：CPI {custom_cpi}% / 核心 {custom_core_cpi}%")
 else:
+    if not us_cpi["ok"]:
+        st.sidebar.caption("⚠️ 美國 CPI 端點暫無法連線，改用手動輸入")
     custom_cpi = st.sidebar.number_input("美國最新公佈 CPI（%）", value=3.8, step=0.1)
     custom_core_cpi = st.sidebar.number_input("美國最新核心 CPI（%）", value=2.8, step=0.1)
 
@@ -677,8 +767,8 @@ with tab_macro:
                     f"{market_data['VIX 恐慌指數']['price']:.2f}",
                 ],
                 "資料來源 / 日期": [
-                    f"{fred_cpi['source']} ({fred_cpi['date']})" if (use_auto_cpi and fred_cpi["ok"]) else "手動輸入",
-                    f"{fred_cpi['source']} ({fred_cpi['date']})" if (use_auto_cpi and fred_cpi["ok"]) else "手動輸入",
+                    f"{us_cpi['source']} ({us_cpi['date']})" if (use_auto_cpi and us_cpi["ok"]) else "手動輸入",
+                    f"{us_cpi['source']} ({us_cpi['date']})" if (use_auto_cpi and us_cpi["ok"]) else "手動輸入",
                     f"Yahoo Finance ({market_data['WTI 紐約原油']['date']})",
                     f"Yahoo Finance ({market_data['VIX 恐慌指數']['date']})",
                 ],
