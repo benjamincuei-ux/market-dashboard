@@ -205,7 +205,7 @@ def _extract_net_oi_from_record(item: dict):
         if _is_value_col(k):
             continue
         kl = k.lower()
-        if ("net" in kl and "openinterest" in kl and "lot" in kl) or ("多空淨額" in k and "未平倉" in k and "口數" in k):
+        if ("net" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or ("多空淨額" in k and "口數" in k):
             try:
                 return int(str(v).replace(",", "").strip())
             except ValueError:
@@ -216,12 +216,12 @@ def _extract_net_oi_from_record(item: dict):
         if _is_value_col(k):
             continue
         kl = k.lower()
-        if ("long" in kl and "openinterest" in kl and "lot" in kl) or ("多方" in k and "未平倉" in k and "口數" in k):
+        if ("long" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or ("多方" in k and "未平倉" in k and "口數" in k):
             try:
                 long_oi = int(str(v).replace(",", "").strip())
             except ValueError:
                 pass
-        if ("short" in kl and "openinterest" in kl and "lot" in kl) or ("空方" in k and "未平倉" in k and "口數" in k):
+        if ("short" in kl and "openinterest" in kl and any(u in kl for u in ("lot", "contract", "volume"))) or ("空方" in k and "未平倉" in k and "口數" in k):
             try:
                 short_oi = int(str(v).replace(",", "").strip())
             except ValueError:
