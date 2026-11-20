@@ -49,6 +49,8 @@ def fetch_global_market_data():
         "VIX 恐慌指數": "^VIX",
         "WTI 紐約原油": "CL=F",
         "布蘭特原油": "BZ=F",
+        "費城半導體": "^SOX",
+        "那斯達克": "^IXIC",
         "S&P 500 指數": "^GSPC",
         "台積電 ADR": "TSM",
         "美元指數": "DX-Y.NYB",
@@ -98,6 +100,13 @@ def compute_dynamic_percentiles():
             if len(bias_series) >= 20:
                 pct_mom = float((bias_series <= bias_series.iloc[-1]).mean() * 100)
                 results["台股半年線乖離百分位"] = round(pct_mom, 1)
+
+        sox_1y = yf.Ticker("^SOX").history(period="1y")["Close"].dropna()
+        if len(sox_1y) >= 125:
+            sox_ma125 = sox_1y.rolling(125).mean()
+            sox_bias = ((sox_1y - sox_ma125) / sox_ma125 * 100).dropna()
+            if len(sox_bias) >= 20:
+                results["費半半年線乖離百分位"] = round(float((sox_bias <= sox_bias.iloc[-1]).mean() * 100), 1)
     except Exception:
         pass
     return results
@@ -861,23 +870,30 @@ with tab_macro:
     st.divider()
     st.subheader("📌 即時盤面與跨市場指標一覽（Yahoo Finance）")
 
-    cards = [
+    cards_row1 = [
+        ("費城半導體 (^SOX)", "", market_data["費城半導體"]),
+        ("那斯達克 (^IXIC)", "", market_data["那斯達克"]),
+        ("台積電 ADR (TSM)", "$", market_data["台積電 ADR"]),
+    ]
+    cards_row2 = [
         ("VIX 恐慌指數", "", market_data["VIX 恐慌指數"]),
         ("WTI 原油 (美元/桶)", "$", market_data["WTI 紐約原油"]),
         ("布蘭特原油 (美元/桶)", "$", market_data["布蘭特原油"]),
-        ("台積電 ADR (TSM)", "$", market_data["台積電 ADR"]),
     ]
 
-    cols = st.columns(4)
-    for col, (label, prefix, item) in zip(cols, cards):
-        with col:
-            st.metric(label, f"{prefix}{item['price']:.2f}", f"{item['change']:.2f}%")
-            st.caption(f"{'✅' if item['ok'] else '❌'} 資料日期：{item['date']}")
+    for row_cards in (cards_row1, cards_row2):
+        cols = st.columns(3)
+        for col, (label, prefix, item) in zip(cols, row_cards):
+            with col:
+                st.metric(label, f"{prefix}{item['price']:,.2f}", f"{item['change']:.2f}%")
+                st.caption(f"{'✅' if item['ok'] else '❌'} 資料日期：{item['date']}")
 
     # 關鍵市場指標走勢圖（日／週／月）
     st.markdown("### 📈 關鍵市場指標走勢圖（日／週／月）")
     trend_options = {
         "台灣加權指數 (^TWII)": ("^TWII", None, None),
+        "費城半導體指數 (^SOX)": ("^SOX", None, None),
+        "那斯達克指數 (^IXIC)": ("^IXIC", None, None),
         "VIX 恐慌指數 (^VIX)": ("^VIX", 18.0, "低於 18 警戒線 (過度樂觀)"),
         "WTI 紐約原油 (CL=F)": ("CL=F", 100.0, "100 美元通膨警戒線"),
         "布蘭特原油 (BZ=F)": ("BZ=F", None, None),
@@ -914,7 +930,7 @@ with tab_backtest:
 
     bc1, bc2, bc3, bc4 = st.columns(4)
     with bc1:
-        bt_ticker = st.selectbox("回測標的", ["0050.TW", "^TWII", "2330.TW", "^GSPC"])
+        bt_ticker = st.selectbox("回測標的", ["0050.TW", "^TWII", "2330.TW", "^SOX", "^IXIC", "^GSPC"])
     with bc2:
         bt_years = st.selectbox("回測年數", [3, 5], index=1)
     with bc3:
