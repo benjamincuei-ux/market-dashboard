@@ -291,106 +291,89 @@ def _extract_net_oi_from_record(item: dict):
     return None
 
 
+def _decode_taifex_csv(content: bytes) -> str:
+    for enc in ("cp950", "big5", "utf-8-sig", "utf-8"):
+        try:
+            text = content.decode(enc)
+            if "商品" in text or "契約" in text or "日期" in text:
+                return text
+        except Exception:
+            continue
+    return content.decode("utf-8", errors="ignore")
+
+
 @st.cache_data(ttl=1800)
 def fetch_taifex_futures_data():
-    """從臺灣期貨交易所 OpenAPI 抓取外資大台淨空單與微台散戶多空比"""
+    """從期交所官方 CSV 下載最近 7 天資料（含週末自動找最近交易日），取得外資大台淨空單與微台散戶多空比"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    inst_url = "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate"
-    daily_urls = [
-        "https://openapi.taifex.com.tw/v1/DailyMarketReportFut",
-        "https://openapi.taifex.com.tw/v1/DailyMarketReport",
-    ]
-
     foreign_tx = {"net_oi": None, "short_abs": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
     retail_tmf = {"ratio": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
 
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    s_str = (now_tw - timedelta(days=7)).strftime("%Y/%m/%d")
+    e_str = now_tw.strftime("%Y/%m/%d")
+
     try:
-        resp = requests.get(inst_url, headers=headers, timeout=8)
+        resp = requests.post(
+            "https://www.taifex.com.tw/cht/3/futContractsDateDown",
+            data={"queryStartDate": s_str, "queryEndDate": e_str},
+            headers=headers,
+            timeout=10,
+        )
         if resp.status_code == 200:
-            records = resp.json()
-            if isinstance(records, list):
-                tmf_inst_net = 0
-                tmf_found = False
-                tmf_date = "最近交易日"
+            text = _decode_taifex_csv(resp.content)
+            df_inst = pd.read_csv(io.StringIO(text))
+            df_inst.columns = [c.strip() for c in df_inst.columns]
+            if {"日期", "商品名稱", "身份別", "多空未平倉口數淨額"}.issubset(df_inst.columns):
+                tx_df = df_inst[
+                    df_inst["商品名稱"].astype(str).str.contains("臺股期貨|台股期貨", na=False)
+                    & df_inst["身份別"].astype(str).str.contains("外資", na=False)
+                ].copy()
+                if not tx_df.empty:
+                    last_tx = tx_df.iloc[-1]
+                    d_norm = str(last_tx["日期"]).strip().replace("/", "-")
+                    net_oi = int(str(last_tx["多空未平倉口數淨額"]).replace(",", "").strip())
+                    foreign_tx = {
+                        "net_oi": net_oi,
+                        "short_abs": max(-net_oi, 0),
+                        "date": d_norm,
+                        "ok": True,
+                        "source": "臺灣期交所 (TAIFEX)",
+                    }
 
-                for item in records:
-                    vals = " ".join(str(v) for v in item.values())
-                    net_oi = _extract_net_oi_from_record(item)
-                    if net_oi is None:
-                        continue
-
-                    date_str = str(item.get("Date") or item.get("日期") or item.get("TradeDate") or "最近交易日").strip()
-                    if len(date_str) == 8 and date_str.isdigit():
-                        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-
-                    if ("臺股期貨" in vals or "台股期貨" in vals) and "外資" in vals and not foreign_tx["ok"]:
-                        foreign_tx = {
-                            "net_oi": net_oi,
-                            "short_abs": max(-net_oi, 0),
-                            "date": date_str,
-                            "ok": True,
-                            "source": "臺灣期交所 (TAIFEX)",
-                        }
-
-                    if "微型臺指" in vals or "微型台指" in vals:
-                        if any(role in vals for role in ("外資", "投信", "自營商")):
-                            tmf_inst_net += net_oi
-                            tmf_found = True
-                            tmf_date = date_str
-
-                if tmf_found:
-                    total_tmf_oi = 0
-                    for d_url in daily_urls:
-                        try:
-                            d_resp = requests.get(d_url, headers=headers, timeout=8)
-                            if d_resp.status_code != 200:
-                                continue
-                            d_records = d_resp.json()
-                            if not isinstance(d_records, list):
-                                continue
-                            for d_item in d_records:
-                                contract = str(d_item.get("Contract") or d_item.get("契約") or "").strip().upper()
-                                session = str(d_item.get("TradingSession") or d_item.get("交易時段") or "")
-                                if contract == "TMF" and ("一般" in session or "Regular" in session or session == ""):
-                                    oi_val = d_item.get("OpenInterest") or d_item.get("未沖銷契約數") or 0
-                                    try:
-                                        total_tmf_oi += int(str(oi_val).replace(",", "").strip())
-                                    except ValueError:
-                                        pass
-                            if total_tmf_oi > 0:
-                                break
-                        except Exception:
-                            continue
-
-                    if total_tmf_oi == 0:
-                        try:
-                            csv_url = "https://www.taifex.com.tw/cht/3/dlFutDataDown"
-                            q_date = tmf_date.replace("-", "/") if "-" in tmf_date else datetime.now().strftime("%Y/%m/%d")
-                            form = {
-                                "down_type": "1",
-                                "commodity_id": "TMF",
-                                "queryStartDate": q_date,
-                                "queryEndDate": q_date,
-                            }
-                            c_resp = requests.post(csv_url, data=form, headers=headers, timeout=8)
-                            if c_resp.status_code == 200 and "未沖銷契約數" in c_resp.text:
-                                df_csv = pd.read_csv(io.StringIO(c_resp.text))
-                                if "未沖銷契約數" in df_csv.columns:
-                                    if "交易時段" in df_csv.columns:
-                                        df_csv = df_csv[df_csv["交易時段"].astype(str).str.contains("一般", na=False)]
-                                    total_tmf_oi = int(pd.to_numeric(df_csv["未沖銷契約數"], errors="coerce").fillna(0).sum())
-                        except Exception:
-                            pass
-
-                    if total_tmf_oi > 0:
-                        retail_net = -tmf_inst_net
-                        ratio_pct = round((retail_net / total_tmf_oi) * 100, 1)
-                        retail_tmf = {
-                            "ratio": ratio_pct,
-                            "date": tmf_date,
-                            "ok": True,
-                            "source": "臺灣期交所換算 (TMF)",
-                        }
+                tmf_df = df_inst[df_inst["商品名稱"].astype(str).str.contains("微型臺指|微型台指", na=False)].copy()
+                if not tmf_df.empty:
+                    tmf_df["d_norm"] = tmf_df["日期"].astype(str).str.strip().str.replace("/", "-", regex=False)
+                    latest_tmf_d = tmf_df["d_norm"].max()
+                    tmf_latest = tmf_df[tmf_df["d_norm"] == latest_tmf_d]
+                    tmf_inst_net = int(
+                        pd.to_numeric(
+                            tmf_latest["多空未平倉口數淨額"].astype(str).str.replace(",", "", regex=False),
+                            errors="coerce",
+                        ).fillna(0).sum()
+                    )
+                    q_d = latest_tmf_d.replace("-", "/")
+                    resp2 = requests.post(
+                        "https://www.taifex.com.tw/cht/3/dlFutDataDown",
+                        data={"down_type": "1", "commodity_id": "TMF", "queryStartDate": q_d, "queryEndDate": q_d},
+                        headers=headers,
+                        timeout=10,
+                    )
+                    if resp2.status_code == 200:
+                        text2 = _decode_taifex_csv(resp2.content)
+                        df_daily = pd.read_csv(io.StringIO(text2))
+                        df_daily.columns = [c.strip() for c in df_daily.columns]
+                        if "未沖銷契約數" in df_daily.columns:
+                            if "交易時段" in df_daily.columns:
+                                df_daily = df_daily[df_daily["交易時段"].astype(str).str.contains("一般", na=False)]
+                            total_oi = int(pd.to_numeric(df_daily["未沖銷契約數"], errors="coerce").fillna(0).sum())
+                            if total_oi > 0:
+                                retail_tmf = {
+                                    "ratio": round((-tmf_inst_net / total_oi) * 100, 1),
+                                    "date": latest_tmf_d,
+                                    "ok": True,
+                                    "source": "臺灣期交所換算 (TMF)",
+                                }
     except Exception:
         pass
 
