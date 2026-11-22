@@ -53,27 +53,31 @@ def fetch_global_market_data():
         "那斯達克": "^IXIC",
         "S&P 500 指數": "^GSPC",
         "台積電 ADR": "TSM",
+        "美元/台幣": "TWD=X",
+        "日經 225": "^N225",
+        "韓國 KOSPI": "^KS11",
         "美元指數": "DX-Y.NYB",
     }
     data = {}
     for name, sym in tickers.items():
         try:
             ticker = yf.Ticker(sym)
-            hist = ticker.history(period="5d")
+            hist = ticker.history(period="2mo")
             if len(hist) >= 2:
                 last_price = float(hist["Close"].iloc[-1])
                 prev_price = float(hist["Close"].iloc[-2])
                 change = ((last_price - prev_price) / prev_price) * 100
+                ma20 = float(hist["Close"].tail(20).mean())
                 data_date = hist.index[-1].strftime("%Y-%m-%d")
-                data[name] = {"price": last_price, "change": change, "date": data_date, "ok": True}
+                data[name] = {"price": last_price, "change": change, "ma20": ma20, "date": data_date, "ok": True}
             elif not hist.empty:
                 last_price = float(hist["Close"].iloc[-1])
                 data_date = hist.index[-1].strftime("%Y-%m-%d")
-                data[name] = {"price": last_price, "change": 0.0, "date": data_date, "ok": True}
+                data[name] = {"price": last_price, "change": 0.0, "ma20": last_price, "date": data_date, "ok": True}
             else:
-                data[name] = {"price": 0.0, "change": 0.0, "date": "無資料", "ok": False}
+                data[name] = {"price": 0.0, "change": 0.0, "ma20": 0.0, "date": "無資料", "ok": False}
         except Exception:
-            data[name] = {"price": 0.0, "change": 0.0, "date": "連線失敗", "ok": False}
+            data[name] = {"price": 0.0, "change": 0.0, "ma20": 0.0, "date": "連線失敗", "ok": False}
     return data
 
 
@@ -107,6 +111,10 @@ def compute_dynamic_percentiles():
             sox_bias = ((sox_1y - sox_ma125) / sox_ma125 * 100).dropna()
             if len(sox_bias) >= 20:
                 results["費半半年線乖離百分位"] = round(float((sox_bias <= sox_bias.iloc[-1]).mean() * 100), 1)
+
+        twd_1y = yf.Ticker("TWD=X").history(period="1y")["Close"].dropna()
+        if len(twd_1y) >= 20:
+            results["台幣貶值百分位"] = round(float((twd_1y <= twd_1y.iloc[-1]).mean() * 100), 1)
     except Exception:
         pass
     return results
@@ -733,7 +741,30 @@ if 0 < vix_val < 18:
     risk_points += 1
     advices.append(("⚠️", f"VIX 指數 {vix_val:.2f}（< 18 市場過度樂觀）", "市場避險情緒極低，遇到突發利空時回檔速度會特別快。", "檢查手中持股的停利與停損點，保留緊急備用現金。"))
 
-fixed_score = min(int((risk_points / 12) * 100), 100)
+# (8) 台幣匯率 + 外資期貨空單共振驗證
+twd_info = market_data["美元/台幣"]
+twd_pct = dyn_pcts.get("台幣貶值百分位", 0.0)
+if twd_info["ok"] and twd_info["price"] > twd_info["ma20"] and twd_pct >= 75 and custom_tx_short > 35000:
+    risk_points += 1
+    advices.append((
+        "🚨",
+        f"外資空單 ＋ 台幣走貶共振（{twd_info['price']:.2f}，近一年貶值百分位 {twd_pct}%）",
+        "台幣高於月線且處於近一年弱勢區，搭配外資期貨空單偏高，代表外資有實質資金匯出壓力。",
+        "反彈不宜重倉追高大型權值股，宜拉高現金防守比例。"
+    ))
+
+# (9) 日韓股市同步跌破月線驗證（不重複加分，作為亞股風險提醒）
+n225 = market_data["日經 225"]
+ks11 = market_data["韓國 KOSPI"]
+if n225["ok"] and ks11["ok"] and n225["price"] < n225["ma20"] and ks11["price"] < ks11["ma20"]:
+    advices.append((
+        "⚠️",
+        "日經 225 與韓國 KOSPI 同步跌破 20 日月線",
+        "亞太主要股市與半導體同業同步轉弱，外資對亞洲市場風險偏好降溫，台股須留意補跌壓力。",
+        "權值與科技股操作宜保守分批，確認日韓指數重新站回月線前不急著放大部位。"
+    ))
+
+fixed_score = min(int((risk_points / 13) * 100), 100)
 
 # 若已有 chips_history.csv >= 10 天，加入融資歷史百分位
 if not chips_df.empty and chips_df["margin_debt"].dropna().shape[0] >= 10:
@@ -859,12 +890,17 @@ with tab_macro:
         ("台積電 ADR (TSM)", "$", market_data["台積電 ADR"]),
     ]
     cards_row2 = [
+        ("美元/台幣 (TWD=X)", "NT$", market_data["美元/台幣"]),
+        ("日經 225 (^N225)", "", market_data["日經 225"]),
+        ("韓國 KOSPI (^KS11)", "", market_data["韓國 KOSPI"]),
+    ]
+    cards_row3 = [
         ("VIX 恐慌指數", "", market_data["VIX 恐慌指數"]),
         ("WTI 原油 (美元/桶)", "$", market_data["WTI 紐約原油"]),
         ("布蘭特原油 (美元/桶)", "$", market_data["布蘭特原油"]),
     ]
 
-    for row_cards in (cards_row1, cards_row2):
+    for row_cards in (cards_row1, cards_row2, cards_row3):
         cols = st.columns(3)
         for col, (label, prefix, item) in zip(cols, row_cards):
             with col:
@@ -875,6 +911,9 @@ with tab_macro:
     st.markdown("### 📈 關鍵市場指標走勢圖（日／週／月）")
     trend_options = {
         "台灣加權指數 (^TWII)": ("^TWII", None, None),
+        "美元/台幣匯率 (TWD=X)": ("TWD=X", None, None),
+        "韓國 KOSPI 指數 (^KS11)": ("^KS11", None, None),
+        "日經 225 指數 (^N225)": ("^N225", None, None),
         "費城半導體指數 (^SOX)": ("^SOX", None, None),
         "那斯達克指數 (^IXIC)": ("^IXIC", None, None),
         "VIX 恐慌指數 (^VIX)": ("^VIX", 18.0, "低於 18 警戒線 (過度樂觀)"),
