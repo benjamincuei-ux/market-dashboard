@@ -43,6 +43,67 @@ def load_chips_history():
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=600)
+def compute_rolling_margin_stats(chips_df: pd.DataFrame, current_margin: float):
+    """依 SPC / 布林通道標準差理論計算滾動式融資警戒線，並檢查融資與大盤背離"""
+    res = {
+        "has_rolling": False,
+        "ma": 4800.0,
+        "yellow_line": 4800.0,
+        "red_line": 5000.0,
+        "z_score": 0.0,
+        "margin_chg_pct": None,
+        "twii_chg_pct": None,
+        "divergence": False,
+        "series_df": None,
+    }
+    if chips_df is None or chips_df.empty or "margin_debt" not in chips_df.columns:
+        return res
+
+    df_m = chips_df[["date", "margin_debt"]].dropna().copy().sort_values("date").reset_index(drop=True)
+    if len(df_m) < 5:
+        return res
+
+    win = min(len(df_m), 60)
+    df_m["ma"] = df_m["margin_debt"].rolling(win, min_periods=5).mean()
+    df_m["std"] = df_m["margin_debt"].rolling(win, min_periods=5).std().fillna(0.0)
+    df_m["yellow_line"] = df_m["ma"] + 1.5 * df_m["std"]
+    df_m["red_line"] = df_m["ma"] + 2.0 * df_m["std"]
+
+    last_ma = float(df_m["ma"].iloc[-1])
+    last_std = max(float(df_m["std"].iloc[-1]), 1.0)
+    yellow_line = round(last_ma + 1.5 * last_std, 1)
+    red_line = round(last_ma + 2.0 * last_std, 1)
+    z_score = round((current_margin - last_ma) / last_std, 2)
+
+    res.update({
+        "has_rolling": True,
+        "ma": round(last_ma, 1),
+        "yellow_line": yellow_line,
+        "red_line": red_line,
+        "z_score": z_score,
+        "series_df": df_m,
+    })
+
+    # 檢查近 20 個交易日融資增幅 vs 加權指數 (^TWII) 漲跌幅背離
+    lookback = min(len(df_m) - 1, 20)
+    if lookback >= 10:
+        prev_margin = float(df_m["margin_debt"].iloc[-1 - lookback])
+        if prev_margin > 0:
+            m_chg = ((current_margin - prev_margin) / prev_margin) * 100
+            res["margin_chg_pct"] = round(m_chg, 2)
+            try:
+                twii = yf.Ticker("^TWII").history(period="2mo")["Close"].dropna()
+                if len(twii) > lookback:
+                    t_chg = ((float(twii.iloc[-1]) - float(twii.iloc[-1 - lookback])) / float(twii.iloc[-1 - lookback])) * 100
+                    res["twii_chg_pct"] = round(t_chg, 2)
+                    if m_chg >= 5.0 and t_chg <= 0.0:
+                        res["divergence"] = True
+            except Exception:
+                pass
+    return res
+
+
 @st.cache_data(ttl=300)
 def fetch_global_market_data():
     tickers = {
@@ -677,7 +738,14 @@ else:
 use_auto_margin = st.sidebar.checkbox("自動帶入證交所上市融資餘額", value=twse_margin["ok"], disabled=not twse_margin["ok"])
 if use_auto_margin and twse_margin["ok"]:
     custom_margin_debt = twse_margin["value"]
-    st.sidebar.info(f"📡 {twse_margin['source']} ({twse_margin['date']})：{custom_margin_debt:,.1f} 億元")
+    _ms_preview = compute_rolling_margin_stats(chips_df, custom_margin_debt)
+    if _ms_preview["has_rolling"]:
+        st.sidebar.info(
+            f"📡 {twse_margin['source']} ({twse_margin['date']})：{custom_margin_debt:,.1f} 億元\n\n"
+            f"📐 滾動警戒線：黃燈 {_ms_preview['yellow_line']:,.1f} / 紅燈 {_ms_preview['red_line']:,.1f} 億 (Z={_ms_preview['z_score']:+.2f})"
+        )
+    else:
+        st.sidebar.info(f"📡 {twse_margin['source']} ({twse_margin['date']})：{custom_margin_debt:,.1f} 億元")
 else:
     custom_margin_debt = st.sidebar.number_input("台股上市融資餘額（億元）", value=4911.0, step=50.0)
 
@@ -713,9 +781,36 @@ elif custom_retail_ratio > 10:
     risk_points += 1
     advices.append(("⚠️", f"微台散戶偏多 {custom_retail_ratio:.1f}%（> 10% 偏熱）", "散戶作多意願升溫，短線波動可能放大。", "縮小單筆投入金額，分批進場為主。"))
 
-if custom_margin_debt > 4800:
-    risk_points += 2
-    advices.append(("🚨", f"上市融資餘額 {custom_margin_debt:,.1f} 億元（> 4,800 億高槓桿）", "市場借錢買股水位過高，若遇急跌易觸發融資追繳與斷頭連鎖賣壓。", "自己絕不使用融資買股，並避開近期融資暴增的中小型飆股。"))
+margin_stats = compute_rolling_margin_stats(chips_df, custom_margin_debt)
+if margin_stats["has_rolling"]:
+    if custom_margin_debt >= margin_stats["red_line"]:
+        risk_points += 2
+        advices.append((
+            "🚨",
+            f"上市融資 {custom_margin_debt:,.1f} 億（突破滾動紅燈線 {margin_stats['red_line']:,.1f} 億，Z={margin_stats['z_score']:+.2f}）",
+            f"融資已衝破近期均值 ({margin_stats['ma']:,.1f} 億) + 2 倍標準差，槓桿水位處於統計極端擁擠區。",
+            "自己絕不使用融資買股，並避開近期融資暴增的中小型飆股。"
+        ))
+    elif custom_margin_debt >= margin_stats["yellow_line"]:
+        risk_points += 1
+        advices.append((
+            "⚠️",
+            f"上市融資 {custom_margin_debt:,.1f} 億（進入滾動警戒線 {margin_stats['yellow_line']:,.1f} 億，Z={margin_stats['z_score']:+.2f}）",
+            f"融資已高於近期均值 + 1.5 倍標準差，市場槓桿意願明顯升溫。",
+            "控制槓桿比例，切忌借錢追高。"
+        ))
+    if margin_stats["divergence"]:
+        risk_points += 1
+        advices.append((
+            "🚨",
+            f"融資與大盤背離（近期融資 {margin_stats['margin_chg_pct']:+.1f}% vs 加權指數 {margin_stats['twii_chg_pct']:+.1f}%）",
+            "大盤走弱但融資卻逆勢大增，代表散戶在下跌過程中積極接刀攤平，籌碼穩定度轉差。",
+            "短線易有二次下殺洗盤風險，建議等待融資降溫後再低接。"
+        ))
+else:
+    if custom_margin_debt > 4800:
+        risk_points += 2
+        advices.append(("🚨", f"上市融資餘額 {custom_margin_debt:,.1f} 億元（> 4,800 億高槓桿）", "市場借錢買股水位過高，若遇急跌易觸發融資追繳與斷頭連鎖賣壓。", "自己絕不使用融資買股，並避開近期融資暴增的中小型飆股。"))
 
 if custom_etf_premium > 3.0:
     risk_points += 1
@@ -857,15 +952,25 @@ with tab_macro:
     else:
         chip_col1, chip_col2 = st.columns(2)
         with chip_col1:
-            df_m = chips_df.dropna(subset=["margin_debt"])
-            if not df_m.empty:
+            if margin_stats["has_rolling"] and margin_stats["series_df"] is not None:
+                df_m = margin_stats["series_df"]
                 fig_m = go.Figure()
-                fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["margin_debt"], name="上市融資餘額(億)", line=dict(color="#d9534f", width=2.2)))
-                fig_m.add_hline(y=4800, line_dash="dash", line_color="gray", annotation_text="4,800億警戒線")
-                fig_m.update_layout(title="上市融資餘額歷史走勢（億元）", height=320, margin=dict(l=20, r=20, t=40, b=20))
+                fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["margin_debt"], name="上市融資餘額", line=dict(color="#1f77b4", width=2.4)))
+                fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["ma"], name="滾動均值 (μ)", line=dict(color="#f0ad4e", width=1.4, dash="dot")))
+                fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["yellow_line"], name="黃燈線 (μ+1.5σ)", line=dict(color="#ff7f0e", width=1.2, dash="dash")))
+                fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["red_line"], name="紅燈線 (μ+2.0σ)", line=dict(color="#d9534f", width=1.4, dash="dash")))
+                fig_m.update_layout(title=f"上市融資餘額與滾動警戒帶（目前 Z={margin_stats['z_score']:+.2f}）", height=330, margin=dict(l=20, r=20, t=40, b=20), hovermode="x unified")
                 st.plotly_chart(fig_m, use_container_width=True)
             else:
-                st.caption("尚無融資餘額歷史紀錄。")
+                df_m = chips_df.dropna(subset=["margin_debt"])
+                if not df_m.empty:
+                    fig_m = go.Figure()
+                    fig_m.add_trace(go.Scatter(x=df_m["date"], y=df_m["margin_debt"], name="上市融資餘額(億)", line=dict(color="#d9534f", width=2.2)))
+                    fig_m.add_hline(y=4800, line_dash="dash", line_color="gray", annotation_text="4,800億警戒線")
+                    fig_m.update_layout(title="上市融資餘額歷史走勢（億元）", height=330, margin=dict(l=20, r=20, t=40, b=20))
+                    st.plotly_chart(fig_m, use_container_width=True)
+                else:
+                    st.caption("尚無融資餘額歷史紀錄。")
 
         with chip_col2:
             df_tx = chips_df.dropna(subset=["tx_foreign_short"])
