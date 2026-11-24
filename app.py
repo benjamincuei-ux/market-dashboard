@@ -69,15 +69,19 @@ def fetch_global_market_data():
                 change = ((last_price - prev_price) / prev_price) * 100
                 ma20 = float(hist["Close"].tail(20).mean())
                 data_date = hist.index[-1].strftime("%Y-%m-%d")
-                data[name] = {"price": last_price, "change": change, "ma20": ma20, "date": data_date, "ok": True}
+                series_df = hist[["Close"]].tail(30).copy()
+                series_df["MA20"] = hist["Close"].rolling(20).mean().tail(30)
+                data[name] = {"price": last_price, "change": change, "ma20": ma20, "date": data_date, "series": series_df, "ok": True}
             elif not hist.empty:
                 last_price = float(hist["Close"].iloc[-1])
                 data_date = hist.index[-1].strftime("%Y-%m-%d")
-                data[name] = {"price": last_price, "change": 0.0, "ma20": last_price, "date": data_date, "ok": True}
+                series_df = hist[["Close"]].tail(30).copy()
+                series_df["MA20"] = last_price
+                data[name] = {"price": last_price, "change": 0.0, "ma20": last_price, "date": data_date, "series": series_df, "ok": True}
             else:
-                data[name] = {"price": 0.0, "change": 0.0, "ma20": 0.0, "date": "無資料", "ok": False}
+                data[name] = {"price": 0.0, "change": 0.0, "ma20": 0.0, "date": "無資料", "series": None, "ok": False}
         except Exception:
-            data[name] = {"price": 0.0, "change": 0.0, "ma20": 0.0, "date": "連線失敗", "ok": False}
+            data[name] = {"price": 0.0, "change": 0.0, "ma20": 0.0, "date": "連線失敗", "series": None, "ok": False}
     return data
 
 
@@ -299,91 +303,84 @@ def _extract_net_oi_from_record(item: dict):
     return None
 
 
-def _decode_taifex_csv(content: bytes) -> str:
-    for enc in ("cp950", "big5", "utf-8-sig", "utf-8"):
-        try:
-            text = content.decode(enc)
-            if "商品" in text or "契約" in text or "日期" in text:
-                return text
-        except Exception:
-            continue
-    return content.decode("utf-8", errors="ignore")
+def _finmind_get(dataset: str, data_id: str, start_date: str, end_date: str):
+    try:
+        resp = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={
+                "dataset": dataset,
+                "data_id": data_id,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            js = resp.json()
+            if js.get("msg") == "success" and isinstance(js.get("data"), list):
+                return pd.DataFrame(js["data"])
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800)
 def fetch_taifex_futures_data():
-    """從期交所官方 CSV 下載最近 7 天資料（含週末自動找最近交易日），取得外資大台淨空單與微台散戶多空比"""
-    headers = {"User-Agent": "Mozilla/5.0"}
+    """透過 FinMind 公開 API 抓取最近 10 天內最新交易日的外資大台淨空單與微台(TMF)/小台(MTX)散戶多空比"""
     foreign_tx = {"net_oi": None, "short_abs": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
     retail_tmf = {"ratio": None, "date": "抓取失敗", "ok": False, "source": "手動輸入"}
 
     now_tw = datetime.utcnow() + timedelta(hours=8)
-    s_str = (now_tw - timedelta(days=7)).strftime("%Y/%m/%d")
-    e_str = now_tw.strftime("%Y/%m/%d")
+    s_str = (now_tw - timedelta(days=10)).strftime("%Y-%m-%d")
+    e_str = now_tw.strftime("%Y-%m-%d")
 
-    try:
-        resp = requests.post(
-            "https://www.taifex.com.tw/cht/3/futContractsDateDown",
-            data={"queryStartDate": s_str, "queryEndDate": e_str},
-            headers=headers,
-            timeout=10,
+    # 1. 外資臺股期貨 (TX)
+    df_tx = _finmind_get("TaiwanFuturesInstitutionalInvestors", "TX", s_str, e_str)
+    if not df_tx.empty and {"date", "institutional_investors", "long_open_interest_balance_volume", "short_open_interest_balance_volume"}.issubset(df_tx.columns):
+        df_f = df_tx[df_tx["institutional_investors"].astype(str).str.contains("外資", na=False)].sort_values("date")
+        if not df_f.empty:
+            last_tx = df_f.iloc[-1]
+            net_oi = int(last_tx["long_open_interest_balance_volume"]) - int(last_tx["short_open_interest_balance_volume"])
+            foreign_tx = {
+                "net_oi": net_oi,
+                "short_abs": max(-net_oi, 0),
+                "date": str(last_tx["date"]).strip(),
+                "ok": True,
+                "source": "FinMind / 期交所 (TX)",
+            }
+
+    # 2. 微台 (TMF) 或小台 (MTX) 散戶多空比
+    for fid, label in (("TMF", "微台TMF"), ("MTX", "小台MTX")):
+        df_inst = _finmind_get("TaiwanFuturesInstitutionalInvestors", fid, s_str, e_str)
+        df_daily = _finmind_get("TaiwanFuturesDaily", fid, s_str, e_str)
+        if df_inst.empty or df_daily.empty:
+            continue
+
+        df_inst["net_oi"] = (
+            pd.to_numeric(df_inst["long_open_interest_balance_volume"], errors="coerce").fillna(0)
+            - pd.to_numeric(df_inst["short_open_interest_balance_volume"], errors="coerce").fillna(0)
         )
-        if resp.status_code == 200:
-            text = _decode_taifex_csv(resp.content)
-            df_inst = pd.read_csv(io.StringIO(text))
-            df_inst.columns = [c.strip() for c in df_inst.columns]
-            if {"日期", "商品名稱", "身份別", "多空未平倉口數淨額"}.issubset(df_inst.columns):
-                tx_df = df_inst[
-                    df_inst["商品名稱"].astype(str).str.contains("臺股期貨|台股期貨", na=False)
-                    & df_inst["身份別"].astype(str).str.contains("外資", na=False)
-                ].copy()
-                if not tx_df.empty:
-                    last_tx = tx_df.iloc[-1]
-                    d_norm = str(last_tx["日期"]).strip().replace("/", "-")
-                    net_oi = int(str(last_tx["多空未平倉口數淨額"]).replace(",", "").strip())
-                    foreign_tx = {
-                        "net_oi": net_oi,
-                        "short_abs": max(-net_oi, 0),
-                        "date": d_norm,
-                        "ok": True,
-                        "source": "臺灣期交所 (TAIFEX)",
-                    }
+        inst_by_date = df_inst.groupby("date")["net_oi"].sum()
 
-                tmf_df = df_inst[df_inst["商品名稱"].astype(str).str.contains("微型臺指|微型台指", na=False)].copy()
-                if not tmf_df.empty:
-                    tmf_df["d_norm"] = tmf_df["日期"].astype(str).str.strip().str.replace("/", "-", regex=False)
-                    latest_tmf_d = tmf_df["d_norm"].max()
-                    tmf_latest = tmf_df[tmf_df["d_norm"] == latest_tmf_d]
-                    tmf_inst_net = int(
-                        pd.to_numeric(
-                            tmf_latest["多空未平倉口數淨額"].astype(str).str.replace(",", "", regex=False),
-                            errors="coerce",
-                        ).fillna(0).sum()
-                    )
-                    q_d = latest_tmf_d.replace("-", "/")
-                    resp2 = requests.post(
-                        "https://www.taifex.com.tw/cht/3/dlFutDataDown",
-                        data={"down_type": "1", "commodity_id": "TMF", "queryStartDate": q_d, "queryEndDate": q_d},
-                        headers=headers,
-                        timeout=10,
-                    )
-                    if resp2.status_code == 200:
-                        text2 = _decode_taifex_csv(resp2.content)
-                        df_daily = pd.read_csv(io.StringIO(text2))
-                        df_daily.columns = [c.strip() for c in df_daily.columns]
-                        if "未沖銷契約數" in df_daily.columns:
-                            if "交易時段" in df_daily.columns:
-                                df_daily = df_daily[df_daily["交易時段"].astype(str).str.contains("一般", na=False)]
-                            total_oi = int(pd.to_numeric(df_daily["未沖銷契約數"], errors="coerce").fillna(0).sum())
-                            if total_oi > 0:
-                                retail_tmf = {
-                                    "ratio": round((-tmf_inst_net / total_oi) * 100, 1),
-                                    "date": latest_tmf_d,
-                                    "ok": True,
-                                    "source": "臺灣期交所換算 (TMF)",
-                                }
-    except Exception:
-        pass
+        if "trading_session" in df_daily.columns:
+            df_daily = df_daily[df_daily["trading_session"] == "position"]
+        df_daily["open_interest"] = pd.to_numeric(df_daily["open_interest"], errors="coerce").fillna(0)
+        oi_by_date = df_daily.groupby("date")["open_interest"].sum()
+
+        valid_dates = sorted(set(inst_by_date.index) & set(oi_by_date.index))
+        for d_str in reversed(valid_dates):
+            total_oi = float(oi_by_date.get(d_str, 0))
+            if total_oi > 0:
+                retail_tmf = {
+                    "ratio": round((-float(inst_by_date[d_str]) / total_oi) * 100, 1),
+                    "date": str(d_str),
+                    "ok": True,
+                    "source": f"FinMind 換算 ({label})",
+                }
+                break
+        if retail_tmf["ok"]:
+            break
 
     return foreign_tx, retail_tmf
 
@@ -900,12 +897,46 @@ with tab_macro:
         ("布蘭特原油 (美元/桶)", "$", market_data["布蘭特原油"]),
     ]
 
-    for row_cards in (cards_row1, cards_row2, cards_row3):
+    for row_idx, row_cards in enumerate((cards_row1, cards_row2, cards_row3)):
         cols = st.columns(3)
-        for col, (label, prefix, item) in zip(cols, row_cards):
+        for col_idx, (col, (label, prefix, item)) in enumerate(zip(cols, row_cards)):
             with col:
                 st.metric(label, f"{prefix}{item['price']:,.2f}", f"{item['change']:.2f}%")
                 st.caption(f"{'✅' if item['ok'] else '❌'} 資料日期：{item['date']}")
+                s_df = item.get("series")
+                if s_df is not None and len(s_df) >= 2:
+                    line_color = "#d9534f" if item["change"] >= 0 else "#2ca02c"
+                    fig_mini = go.Figure()
+                    fig_mini.add_trace(
+                        go.Scatter(
+                            x=s_df.index,
+                            y=s_df["Close"],
+                            mode="lines",
+                            name="收盤",
+                            line=dict(color=line_color, width=2),
+                            fill="tozeroy",
+                            fillcolor="rgba(217,83,79,0.08)" if item["change"] >= 0 else "rgba(44,160,44,0.08)",
+                        )
+                    )
+                    if "MA20" in s_df.columns and s_df["MA20"].notna().any():
+                        fig_mini.add_trace(
+                            go.Scatter(
+                                x=s_df.index,
+                                y=s_df["MA20"],
+                                mode="lines",
+                                name="20MA",
+                                line=dict(color="#888888", width=1, dash="dot"),
+                            )
+                        )
+                    fig_mini.update_layout(
+                        height=130,
+                        margin=dict(l=0, r=0, t=5, b=0),
+                        showlegend=False,
+                        xaxis=dict(visible=False),
+                        yaxis=dict(visible=True, tickfont=dict(size=9), nticks=3),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_mini, use_container_width=True, key=f"mini_{row_idx}_{col_idx}")
 
     # 關鍵市場指標走勢圖（日／週／月）
     st.markdown("### 📈 關鍵市場指標走勢圖（日／週／月）")
