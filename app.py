@@ -1351,14 +1351,32 @@ with tab_portfolio:
     st.caption("上傳券商庫存截圖，除了逐檔買賣建議，系統會自動計算**持股權重圓餅圖、單一持股與產業集中度警訊**，並依大盤燈號試算建議加減碼金額。")
 
     secret_key = ""
+    app_pin = ""
     try:
-        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+        secret_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        app_pin = str(st.secrets.get("APP_PIN", "")).strip()
     except Exception:
-        secret_key = ""
+        secret_key, app_pin = "", ""
 
     p_col1, p_col2 = st.columns(2)
+    active_api_key = ""
     with p_col1:
-        api_key_input = st.text_input("Gemini API Key", value=secret_key, type="password")
+        if secret_key and app_pin:
+            pin_input = st.text_input("🔐 個人解鎖碼（輸入正確即可啟用後台安全金鑰）", value="", type="password")
+            if pin_input == app_pin:
+                active_api_key = secret_key
+                st.success("✅ 解鎖成功，已於伺服器端安全載入個人金鑰。")
+            else:
+                visitor_key = st.text_input("或：訪客自行貼上臨時 Gemini API Key（不會儲存）", value="", type="password")
+                if visitor_key.strip():
+                    active_api_key = visitor_key.strip()
+        elif secret_key:
+            active_api_key = secret_key
+            st.info("🔒 已於伺服器端安全載入後台金鑰（未傳送至瀏覽器）。分享給他人前，建議於 Secrets 補上 `APP_PIN` 避免額度被消耗。")
+        else:
+            visitor_key = st.text_input("Gemini API Key（僅供本次辨識，不會儲存）", value="", type="password")
+            if visitor_key.strip():
+                active_api_key = visitor_key.strip()
     with p_col2:
         cash_reserve = st.number_input("目前帳戶預備現金（萬元，供計算股債／現金水位）", min_value=0.0, value=0.0, step=10.0)
 
@@ -1370,13 +1388,13 @@ with tab_portfolio:
         with img_col1:
             st.image(pil_img, caption="已上傳的庫存截圖", use_container_width=True)
         with img_col2:
-            if not api_key_input:
-                st.warning("尚未設定 `GEMINI_API_KEY`，請於 Streamlit Cloud Secrets 加入或貼於上方密碼欄。")
+            if not active_api_key:
+                st.warning("請輸入正確的個人解鎖碼，或貼上自己的 Gemini API Key 以進行截圖辨識。")
             else:
                 if st.button("🤖 辨識截圖並進行達利歐投資組合健檢", type="primary"):
                     with st.spinner("正在辨識截圖、抓取估值與技術面並計算投資組合集中度..."):
                         try:
-                            holdings = parse_holdings_from_image(pil_img, api_key_input)
+                            holdings = parse_holdings_from_image(pil_img, active_api_key)
                             results = []
                             val_rows = []
                             for h in holdings:
